@@ -42,8 +42,6 @@ public class DefaultMcpTransportBuilder implements McpTransportBuilder {
     } else if (connectionParams instanceof StreamableHttpServerParameters streamableParams) {
       return HttpClientStreamableHttpTransport.builder(streamableParams.url())
           .connectTimeout(streamableParams.timeout())
-          // HttpClientStreamableHttpTransport uses connectTimeout for general HTTP ops
-          // and sseReadTimeout for the SSE stream part.
           .asyncHttpRequestCustomizer(
               (builder, method, uri, body) -> {
                 streamableParams.headers().forEach((key, value) -> builder.header(key, value));
