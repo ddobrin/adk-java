@@ -16,26 +16,35 @@
 
 package com.google.adk.runner;
 
-import com.google.adk.Telemetry;
 import com.google.adk.agents.ActiveStreamingTool;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LiveRequestQueue;
 import com.google.adk.agents.LlmAgent;
 import com.google.adk.agents.RunConfig;
+import com.google.adk.apps.App;
+import com.google.adk.apps.ResumabilityConfig;
 import com.google.adk.artifacts.BaseArtifactService;
+import com.google.adk.artifacts.InMemoryArtifactService;
 import com.google.adk.events.Event;
 import com.google.adk.events.EventActions;
 import com.google.adk.memory.BaseMemoryService;
-import com.google.adk.plugins.BasePlugin;
+import com.google.adk.models.Model;
+import com.google.adk.plugins.Plugin;
 import com.google.adk.plugins.PluginManager;
 import com.google.adk.sessions.BaseSessionService;
+import com.google.adk.sessions.InMemorySessionService;
 import com.google.adk.sessions.Session;
+import com.google.adk.summarizer.EventsCompactionConfig;
+import com.google.adk.summarizer.LlmEventSummarizer;
+import com.google.adk.summarizer.SlidingWindowEventCompactor;
+import com.google.adk.telemetry.Tracing;
 import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.FunctionTool;
 import com.google.adk.utils.CollectionUtils;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.errorprone.annotations.InlineMe;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.genai.types.AudioTranscriptionConfig;
 import com.google.genai.types.Content;
 import com.google.genai.types.Modality;
@@ -47,8 +56,8 @@ import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
-import java.lang.reflect.Parameter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -62,42 +71,225 @@ public class Runner {
   private final String appName;
   private final BaseArtifactService artifactService;
   private final BaseSessionService sessionService;
-  private final @Nullable BaseMemoryService memoryService;
+  @Nullable private final BaseMemoryService memoryService;
   private final PluginManager pluginManager;
+  private final ResumabilityConfig resumabilityConfig;
+  @Nullable private final EventsCompactionConfig eventsCompactionConfig;
 
-  /** Creates a new {@code Runner}. */
+  /** Builder for {@link Runner}. */
+  public static class Builder {
+    private App app;
+    private BaseAgent agent;
+    private String appName;
+    private BaseArtifactService artifactService = new InMemoryArtifactService();
+    private BaseSessionService sessionService = new InMemorySessionService();
+    @Nullable private BaseMemoryService memoryService = null;
+    private List<? extends Plugin> plugins = ImmutableList.of();
+
+    @CanIgnoreReturnValue
+    public Builder app(App app) {
+      Preconditions.checkState(this.agent == null, "app() cannot be called when agent() is set.");
+      this.app = app;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder agent(BaseAgent agent) {
+      Preconditions.checkState(this.app == null, "agent() cannot be called when app is set.");
+      this.agent = agent;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder appName(String appName) {
+      Preconditions.checkState(this.app == null, "appName() cannot be called when app is set.");
+      this.appName = appName;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder artifactService(BaseArtifactService artifactService) {
+      this.artifactService = artifactService;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder sessionService(BaseSessionService sessionService) {
+      this.sessionService = sessionService;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder memoryService(BaseMemoryService memoryService) {
+      this.memoryService = memoryService;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    public Builder plugins(List<? extends Plugin> plugins) {
+      Preconditions.checkState(this.app == null, "plugins() cannot be called when app is set.");
+      this.plugins = plugins;
+      return this;
+    }
+
+    public Runner build() {
+      BaseAgent buildAgent;
+      String buildAppName;
+      List<? extends Plugin> buildPlugins;
+      ResumabilityConfig buildResumabilityConfig;
+      EventsCompactionConfig buildEventsCompactionConfig;
+
+      if (this.app != null) {
+        if (this.agent != null) {
+          throw new IllegalStateException("agent() cannot be called when app() is called.");
+        }
+        if (!this.plugins.isEmpty()) {
+          throw new IllegalStateException("plugins() cannot be called when app() is called.");
+        }
+        buildAgent = this.app.rootAgent();
+        buildPlugins = this.app.plugins();
+        buildAppName = this.appName == null ? this.app.name() : this.appName;
+        buildResumabilityConfig =
+            this.app.resumabilityConfig() != null
+                ? this.app.resumabilityConfig()
+                : new ResumabilityConfig();
+        buildEventsCompactionConfig = this.app.eventsCompactionConfig();
+      } else {
+        buildAgent = this.agent;
+        buildAppName = this.appName;
+        buildPlugins = this.plugins;
+        buildResumabilityConfig = new ResumabilityConfig();
+        buildEventsCompactionConfig = null;
+      }
+
+      if (buildAgent == null) {
+        throw new IllegalStateException("Agent must be provided via app() or agent().");
+      }
+      if (buildAppName == null) {
+        throw new IllegalStateException("App name must be provided via app() or appName().");
+      }
+      if (artifactService == null) {
+        throw new IllegalStateException("Artifact service must be provided.");
+      }
+      if (sessionService == null) {
+        throw new IllegalStateException("Session service must be provided.");
+      }
+      return new Runner(
+          buildAgent,
+          buildAppName,
+          artifactService,
+          sessionService,
+          memoryService,
+          buildPlugins,
+          buildResumabilityConfig,
+          buildEventsCompactionConfig);
+    }
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  /**
+   * Creates a new {@code Runner}.
+   *
+   * @deprecated Use {@link Runner.Builder} instead.
+   */
+  @Deprecated
   public Runner(
       BaseAgent agent,
       String appName,
       BaseArtifactService artifactService,
       BaseSessionService sessionService,
       @Nullable BaseMemoryService memoryService) {
-    this(agent, appName, artifactService, sessionService, memoryService, ImmutableList.of());
+    this(
+        agent,
+        appName,
+        artifactService,
+        sessionService,
+        memoryService,
+        ImmutableList.of(),
+        new ResumabilityConfig());
   }
 
-  /** Creates a new {@code Runner} with a list of plugins. */
+  /**
+   * Creates a new {@code Runner} with a list of plugins.
+   *
+   * @deprecated Use {@link Runner.Builder} instead.
+   */
+  @Deprecated
   public Runner(
       BaseAgent agent,
       String appName,
       BaseArtifactService artifactService,
       BaseSessionService sessionService,
       @Nullable BaseMemoryService memoryService,
-      List<BasePlugin> plugins) {
+      List<? extends Plugin> plugins) {
+    this(
+        agent,
+        appName,
+        artifactService,
+        sessionService,
+        memoryService,
+        plugins,
+        new ResumabilityConfig());
+  }
+
+  /**
+   * Creates a new {@code Runner} with a list of plugins and resumability config.
+   *
+   * @deprecated Use {@link Runner.Builder} instead.
+   */
+  @Deprecated
+  public Runner(
+      BaseAgent agent,
+      String appName,
+      BaseArtifactService artifactService,
+      BaseSessionService sessionService,
+      @Nullable BaseMemoryService memoryService,
+      List<? extends Plugin> plugins,
+      ResumabilityConfig resumabilityConfig) {
+    this(
+        agent,
+        appName,
+        artifactService,
+        sessionService,
+        memoryService,
+        plugins,
+        resumabilityConfig,
+        null);
+  }
+
+  /**
+   * Creates a new {@code Runner} with a list of plugins and resumability config.
+   *
+   * @deprecated Use {@link Runner.Builder} instead.
+   */
+  @Deprecated
+  protected Runner(
+      BaseAgent agent,
+      String appName,
+      BaseArtifactService artifactService,
+      BaseSessionService sessionService,
+      @Nullable BaseMemoryService memoryService,
+      List<? extends Plugin> plugins,
+      ResumabilityConfig resumabilityConfig,
+      @Nullable EventsCompactionConfig eventsCompactionConfig) {
     this.agent = agent;
     this.appName = appName;
     this.artifactService = artifactService;
     this.sessionService = sessionService;
     this.memoryService = memoryService;
     this.pluginManager = new PluginManager(plugins);
+    this.resumabilityConfig = resumabilityConfig;
+    this.eventsCompactionConfig = createEventsCompactionConfig(agent, eventsCompactionConfig);
   }
 
   /**
    * Creates a new {@code Runner}.
    *
-   * @deprecated Use the constructor with {@code BaseMemoryService} instead even if with a null if
-   *     you don't need the memory service.
+   * @deprecated Use {@link Runner.Builder} instead.
    */
-  @InlineMe(replacement = "this(agent, appName, artifactService, sessionService, null)")
   @Deprecated
   public Runner(
       BaseAgent agent,
@@ -123,7 +315,8 @@ public class Runner {
     return this.sessionService;
   }
 
-  public @Nullable BaseMemoryService memoryService() {
+  @Nullable
+  public BaseMemoryService memoryService() {
     return this.memoryService;
   }
 
@@ -147,9 +340,8 @@ public class Runner {
     }
 
     if (this.artifactService != null && saveInputBlobsAsArtifacts) {
-      // The runner directly saves the artifacts (if applicable) in the
-      // user message and replaces the artifact data with a file name
-      // placeholder.
+      // The runner directly saves the artifacts (if applicable) in the user message and replaces
+      // the artifact data with a file name placeholder.
       for (int i = 0; i < newMessage.parts().get().size(); i++) {
         Part part = newMessage.parts().get().get(i);
         if (part.inlineData().isEmpty()) {
@@ -214,9 +406,15 @@ public class Runner {
         this.sessionService.getSession(appName, userId, sessionId, Optional.empty());
     return maybeSession
         .switchIfEmpty(
-            Single.error(
-                new IllegalArgumentException(
-                    String.format("Session not found: %s for user %s", sessionId, userId))))
+            Single.defer(
+                () -> {
+                  if (runConfig.autoCreateSession()) {
+                    return this.sessionService.createSession(appName, userId, null, sessionId);
+                  }
+                  return Single.error(
+                      new IllegalArgumentException(
+                          String.format("Session not found: %s for user %s", sessionId, userId)));
+                }))
         .flatMapPublisher(session -> this.runAsync(session, newMessage, runConfig, stateDelta));
   }
 
@@ -252,7 +450,7 @@ public class Runner {
       RunConfig runConfig,
       @Nullable Map<String, Object> stateDelta) {
     Span span =
-        Telemetry.getTracer().spanBuilder("invocation").setParent(Context.current()).startSpan();
+        Tracing.getTracer().spanBuilder("invocation").setParent(Context.current()).startSpan();
     Context spanContext = Context.current().with(span);
 
     try {
@@ -261,22 +459,21 @@ public class Runner {
 
       // Create initial context
       InvocationContext initialContext =
-          newInvocationContextWithId(
-              session,
-              Optional.of(newMessage),
-              /* liveRequestQueue= */ Optional.empty(),
-              runConfig,
-              invocationId);
+          newInvocationContextBuilder(session)
+              .invocationId(invocationId)
+              .runConfig(runConfig)
+              .userContent(newMessage)
+              .build();
 
-      return Telemetry.traceFlowable(
+      return Tracing.traceFlowable(
           spanContext,
           span,
           () ->
               Flowable.defer(
                       () ->
                           this.pluginManager
-                              .runOnUserMessageCallback(initialContext, newMessage)
-                              .switchIfEmpty(Single.just(newMessage))
+                              .onUserMessageCallback(initialContext, newMessage)
+                              .defaultIfEmpty(newMessage)
                               .flatMap(
                                   content ->
                                       (content != null)
@@ -289,6 +486,9 @@ public class Runner {
                                           : Single.just(null))
                               .flatMapPublisher(
                                   event -> {
+                                    if (event == null) {
+                                      return Flowable.empty();
+                                    }
                                     // Get the updated session after the message and state delta are
                                     // applied
                                     return this.sessionService
@@ -298,76 +498,14 @@ public class Runner {
                                             session.id(),
                                             Optional.empty())
                                         .flatMapPublisher(
-                                            updatedSession -> {
-                                              // Create context with updated session for
-                                              // beforeRunCallback
-                                              InvocationContext contextWithUpdatedSession =
-                                                  newInvocationContextWithId(
-                                                      updatedSession,
-                                                      event.content(),
-                                                      Optional.empty(),
-                                                      runConfig,
-                                                      invocationId);
-                                              contextWithUpdatedSession.agent(
-                                                  this.findAgentToRun(updatedSession, rootAgent));
-
-                                              // Call beforeRunCallback with updated session
-                                              Maybe<Event> beforeRunEvent =
-                                                  this.pluginManager
-                                                      .runBeforeRunCallback(
-                                                          contextWithUpdatedSession)
-                                                      .map(
-                                                          content ->
-                                                              Event.builder()
-                                                                  .id(Event.generateEventId())
-                                                                  .invocationId(
-                                                                      contextWithUpdatedSession
-                                                                          .invocationId())
-                                                                  .author("model")
-                                                                  .content(Optional.of(content))
-                                                                  .build());
-
-                                              // Agent execution
-                                              Flowable<Event> agentEvents =
-                                                  contextWithUpdatedSession
-                                                      .agent()
-                                                      .runAsync(contextWithUpdatedSession)
-                                                      .flatMap(
-                                                          agentEvent ->
-                                                              this.sessionService
-                                                                  .appendEvent(
-                                                                      updatedSession, agentEvent)
-                                                                  .flatMap(
-                                                                      registeredEvent -> {
-                                                                        // TODO: remove this hack
-                                                                        // after
-                                                                        // deprecating runAsync with
-                                                                        // Session.
-                                                                        copySessionStates(
-                                                                            updatedSession,
-                                                                            session);
-                                                                        return contextWithUpdatedSession
-                                                                            .pluginManager()
-                                                                            .runOnEventCallback(
-                                                                                contextWithUpdatedSession,
-                                                                                registeredEvent)
-                                                                            .defaultIfEmpty(
-                                                                                registeredEvent);
-                                                                      })
-                                                                  .toFlowable());
-
-                                              // If beforeRunCallback returns content, emit it and
-                                              // skip
-                                              // agent
-                                              return beforeRunEvent
-                                                  .toFlowable()
-                                                  .switchIfEmpty(agentEvents)
-                                                  .concatWith(
-                                                      Completable.defer(
-                                                          () ->
-                                                              pluginManager.runAfterRunCallback(
-                                                                  contextWithUpdatedSession)));
-                                            });
+                                            updatedSession ->
+                                                runAgentWithFreshSession(
+                                                    session,
+                                                    updatedSession,
+                                                    event,
+                                                    invocationId,
+                                                    runConfig,
+                                                    rootAgent));
                                   }))
                   .doOnError(
                       throwable -> {
@@ -382,11 +520,75 @@ public class Runner {
     }
   }
 
+  private Flowable<Event> runAgentWithFreshSession(
+      Session session,
+      Session updatedSession,
+      Event event,
+      String invocationId,
+      RunConfig runConfig,
+      BaseAgent rootAgent) {
+    // Create context with updated session for beforeRunCallback
+    InvocationContext contextWithUpdatedSession =
+        newInvocationContextBuilder(updatedSession)
+            .invocationId(invocationId)
+            .agent(this.findAgentToRun(updatedSession, rootAgent))
+            .runConfig(runConfig)
+            .userContent(event.content().orElseGet(Content::fromParts))
+            .build();
+
+    // Call beforeRunCallback with updated session
+    Maybe<Event> beforeRunEvent =
+        this.pluginManager
+            .beforeRunCallback(contextWithUpdatedSession)
+            .map(
+                content ->
+                    Event.builder()
+                        .id(Event.generateEventId())
+                        .invocationId(contextWithUpdatedSession.invocationId())
+                        .author("model")
+                        .content(Optional.of(content))
+                        .build());
+
+    // Agent execution
+    Flowable<Event> agentEvents =
+        contextWithUpdatedSession
+            .agent()
+            .runAsync(contextWithUpdatedSession)
+            .flatMap(
+                agentEvent ->
+                    this.sessionService
+                        .appendEvent(updatedSession, agentEvent)
+                        .flatMap(
+                            registeredEvent -> {
+                              // TODO: remove this hack after deprecating runAsync with Session.
+                              copySessionStates(updatedSession, session);
+                              return contextWithUpdatedSession
+                                  .pluginManager()
+                                  .onEventCallback(contextWithUpdatedSession, registeredEvent)
+                                  .defaultIfEmpty(registeredEvent);
+                            })
+                        .toFlowable());
+
+    // If beforeRunCallback returns content, emit it and skip agent
+    return beforeRunEvent
+        .toFlowable()
+        .switchIfEmpty(agentEvents)
+        .concatWith(
+            Completable.defer(() -> pluginManager.runAfterRunCallback(contextWithUpdatedSession)))
+        .concatWith(Completable.defer(() -> compactEvents(updatedSession)));
+  }
+
+  private Completable compactEvents(Session session) {
+    return Optional.ofNullable(eventsCompactionConfig)
+        .filter(EventsCompactionConfig::hasSlidingWindowCompactionConfig)
+        .map(SlidingWindowEventCompactor::new)
+        .map(c -> c.compact(session, sessionService))
+        .orElseGet(Completable::complete);
+  }
+
   private void copySessionStates(Session source, Session target) {
     // TODO: remove this hack when deprecating all runAsync with Session.
-    for (var entry : source.state().entrySet()) {
-      target.state().put(entry.getKey(), entry.getValue());
-    }
+    target.state().putAll(source.state());
   }
 
   /**
@@ -415,64 +617,26 @@ public class Runner {
         runConfigBuilder.setInputAudioTranscription(AudioTranscriptionConfig.builder().build());
       }
     }
-    return newInvocationContext(
-        session, /* newMessage= */ Optional.empty(), liveRequestQueue, runConfigBuilder.build());
+    InvocationContext.Builder builder =
+        newInvocationContextBuilder(session)
+            .runConfig(runConfigBuilder.build())
+            .userContent(Content.fromParts());
+    liveRequestQueue.ifPresent(builder::liveRequestQueue);
+    return builder.build();
   }
 
-  /**
-   * Creates an {@link InvocationContext} for the given session, request queue, and config.
-   *
-   * @return a new {@link InvocationContext}.
-   */
-  private InvocationContext newInvocationContext(
-      Session session,
-      Optional<Content> newMessage,
-      Optional<LiveRequestQueue> liveRequestQueue,
-      RunConfig runConfig) {
+  private InvocationContext.Builder newInvocationContextBuilder(Session session) {
     BaseAgent rootAgent = this.agent;
-    InvocationContext invocationContext =
-        InvocationContext.builder()
-            .sessionService(this.sessionService)
-            .artifactService(this.artifactService)
-            .memoryService(this.memoryService)
-            .pluginManager(this.pluginManager)
-            .liveRequestQueue(liveRequestQueue)
-            .agent(rootAgent)
-            .session(session)
-            .userContent(newMessage)
-            .runConfig(runConfig)
-            .build();
-    invocationContext.agent(this.findAgentToRun(session, rootAgent));
-    return invocationContext;
-  }
-
-  /**
-   * Creates a new InvocationContext with a specific invocation ID.
-   *
-   * @return a new {@link InvocationContext} with the specified invocation ID.
-   */
-  private InvocationContext newInvocationContextWithId(
-      Session session,
-      Optional<Content> newMessage,
-      Optional<LiveRequestQueue> liveRequestQueue,
-      RunConfig runConfig,
-      String invocationId) {
-    BaseAgent rootAgent = this.agent;
-    InvocationContext invocationContext =
-        InvocationContext.builder()
-            .sessionService(this.sessionService)
-            .artifactService(this.artifactService)
-            .memoryService(this.memoryService)
-            .pluginManager(this.pluginManager)
-            .liveRequestQueue(liveRequestQueue)
-            .invocationId(invocationId)
-            .agent(rootAgent)
-            .session(session)
-            .userContent(newMessage)
-            .runConfig(runConfig)
-            .build();
-    invocationContext.agent(this.findAgentToRun(session, rootAgent));
-    return invocationContext;
+    return InvocationContext.builder()
+        .sessionService(this.sessionService)
+        .artifactService(this.artifactService)
+        .memoryService(this.memoryService)
+        .pluginManager(this.pluginManager)
+        .agent(rootAgent)
+        .session(session)
+        .resumabilityConfig(this.resumabilityConfig)
+        .eventsCompactionConfig(this.eventsCompactionConfig)
+        .agent(this.findAgentToRun(session, rootAgent));
   }
 
   /**
@@ -483,41 +647,45 @@ public class Runner {
   public Flowable<Event> runLive(
       Session session, LiveRequestQueue liveRequestQueue, RunConfig runConfig) {
     Span span =
-        Telemetry.getTracer().spanBuilder("invocation").setParent(Context.current()).startSpan();
+        Tracing.getTracer().spanBuilder("invocation").setParent(Context.current()).startSpan();
     Context spanContext = Context.current().with(span);
 
     try {
       InvocationContext invocationContext =
           newInvocationContextForLive(session, Optional.of(liveRequestQueue), runConfig);
-      if (invocationContext.agent() instanceof LlmAgent) {
-        LlmAgent agent = (LlmAgent) invocationContext.agent();
-        for (BaseTool tool : agent.tools()) {
-          if (tool instanceof FunctionTool functionTool) {
-            for (Parameter parameter : functionTool.func().getParameters()) {
-              if (parameter.getType().equals(LiveRequestQueue.class)) {
-                invocationContext
-                    .activeStreamingTools()
-                    .put(functionTool.name(), new ActiveStreamingTool(new LiveRequestQueue()));
-              }
-            }
-          }
-        }
+
+      Single<InvocationContext> invocationContextSingle;
+      if (invocationContext.agent() instanceof LlmAgent agent) {
+        invocationContextSingle =
+            agent
+                .tools()
+                .map(
+                    tools -> {
+                      this.addActiveStreamingTools(invocationContext, tools);
+                      return invocationContext;
+                    });
+      } else {
+        invocationContextSingle = Single.just(invocationContext);
       }
-      return Telemetry.traceFlowable(
-          spanContext,
-          span,
-          () ->
-              invocationContext
-                  .agent()
-                  .runLive(invocationContext)
-                  .doOnNext(event -> this.sessionService.appendEvent(session, event))
-                  .onErrorResumeNext(
-                      throwable -> {
-                        span.setStatus(StatusCode.ERROR, "Error in runLive Flowable execution");
-                        span.recordException(throwable);
-                        span.end();
-                        return Flowable.error(throwable);
-                      }));
+
+      return invocationContextSingle.flatMapPublisher(
+          updatedInvocationContext ->
+              Tracing.traceFlowable(
+                  spanContext,
+                  span,
+                  () ->
+                      updatedInvocationContext
+                          .agent()
+                          .runLive(updatedInvocationContext)
+                          .doOnNext(event -> this.sessionService.appendEvent(session, event))
+                          .onErrorResumeNext(
+                              throwable -> {
+                                span.setStatus(
+                                    StatusCode.ERROR, "Error in runLive Flowable execution");
+                                span.recordException(throwable);
+                                span.end();
+                                return Flowable.error(throwable);
+                              })));
     } catch (Throwable t) {
       span.setStatus(StatusCode.ERROR, "Error during runLive synchronous setup");
       span.recordException(t);
@@ -536,15 +704,17 @@ public class Runner {
       String userId, String sessionId, LiveRequestQueue liveRequestQueue, RunConfig runConfig) {
     return this.sessionService
         .getSession(appName, userId, sessionId, Optional.empty())
-        .flatMapPublisher(
-            session -> {
-              if (session == null) {
-                return Flowable.error(
-                    new IllegalArgumentException(
-                        String.format("Session not found: %s for user %s", sessionId, userId)));
-              }
-              return this.runLive(session, liveRequestQueue, runConfig);
-            });
+        .switchIfEmpty(
+            Single.defer(
+                () -> {
+                  if (runConfig.autoCreateSession()) {
+                    return this.sessionService.createSession(appName, userId, null, sessionId);
+                  }
+                  return Single.error(
+                      new IllegalArgumentException(
+                          String.format("Session not found: %s for user %s", sessionId, userId)));
+                }))
+        .flatMapPublisher(session -> this.runLive(session, liveRequestQueue, runConfig));
   }
 
   /**
@@ -599,18 +769,60 @@ public class Runner {
         return rootAgent;
       }
 
-      BaseAgent agent = rootAgent.findSubAgent(author);
+      Optional<BaseAgent> agent = rootAgent.findSubAgent(author);
 
-      if (agent == null) {
+      if (agent.isEmpty()) {
         continue;
       }
 
-      if (this.isTransferableAcrossAgentTree(agent)) {
-        return agent;
+      if (this.isTransferableAcrossAgentTree(agent.get())) {
+        return agent.get();
       }
     }
 
     return rootAgent;
+  }
+
+  private void addActiveStreamingTools(InvocationContext invocationContext, List<BaseTool> tools) {
+    tools.stream()
+        .filter(FunctionTool.class::isInstance)
+        .map(FunctionTool.class::cast)
+        .filter(this::hasLiveRequestQueueParameter)
+        .forEach(
+            tool ->
+                invocationContext
+                    .activeStreamingTools()
+                    .put(tool.name(), new ActiveStreamingTool(new LiveRequestQueue())));
+  }
+
+  private boolean hasLiveRequestQueueParameter(FunctionTool functionTool) {
+    return Arrays.stream(functionTool.func().getParameters())
+        .anyMatch(parameter -> parameter.getType().equals(LiveRequestQueue.class));
+  }
+
+  @Nullable
+  private static EventsCompactionConfig createEventsCompactionConfig(
+      BaseAgent agent, @Nullable EventsCompactionConfig config) {
+    if (config == null || config.summarizer() != null) {
+      return config;
+    }
+    LlmEventSummarizer summarizer =
+        Optional.of(agent)
+            .filter(LlmAgent.class::isInstance)
+            .map(LlmAgent.class::cast)
+            .flatMap(LlmAgent::model)
+            .flatMap(Model::model)
+            .map(LlmEventSummarizer::new)
+            .orElseThrow(
+                () ->
+                    new IllegalArgumentException(
+                        "No BaseLlm model available for event compaction"));
+    return new EventsCompactionConfig(
+        config.compactionInterval(),
+        config.overlapSize(),
+        summarizer,
+        config.tokenThreshold(),
+        config.eventRetentionSize());
   }
 
   // TODO: run statelessly

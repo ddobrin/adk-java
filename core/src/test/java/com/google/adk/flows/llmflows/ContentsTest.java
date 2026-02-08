@@ -17,17 +17,17 @@
 package com.google.adk.flows.llmflows;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.truth.Correspondence.transforming;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LlmAgent;
-import com.google.adk.agents.RunConfig;
-import com.google.adk.artifacts.InMemoryArtifactService;
 import com.google.adk.events.Event;
+import com.google.adk.events.EventActions;
+import com.google.adk.events.EventCompaction;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.Model;
-import com.google.adk.sessions.InMemorySessionService;
 import com.google.adk.sessions.Session;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -490,12 +490,209 @@ public final class ContentsTest {
         .hasValue("tool2");
   }
 
+  @Test
+  public void processRequest_singleCompaction() {
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("env1", "content 1", "inv1", 1),
+            createUserEvent("env2", "content 2", "inv2", 2),
+            createCompactedEvent(1, 2, "Summary 1-2"),
+            createUserEvent("env3", "content 3", "inv3", 3));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("Summary 1-2", "content 3");
+  }
+
+  @Test
+  public void processRequest_startsWithCompaction() {
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createCompactedEvent(1, 2, "Summary 1-2"),
+            createUserEvent("env3", "content 3", "inv3", 3),
+            createUserEvent("env4", "content 4", "inv4", 4));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("Summary 1-2", "content 3", "content 4");
+  }
+
+  @Test
+  public void processRequest_endsWithCompaction() {
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("env1", "content 1", "inv1", 1),
+            createUserEvent("env2", "content 2", "inv2", 2),
+            createUserEvent("env3", "content 3", "inv3", 2),
+            createCompactedEvent(2, 3, "Summary 2-3"));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("content 1", "Summary 2-3");
+  }
+
+  @Test
+  public void processRequest_multipleCompactions() {
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("env1", "content 1", "inv1", 1),
+            createUserEvent("env2", "content 2", "inv2", 2),
+            createUserEvent("env3", "content 3", "inv3", 3),
+            createUserEvent("env4", "content 4", "inv4", 4),
+            createCompactedEvent(1, 4, "Summary 1-4"),
+            createUserEvent("env5", "content 5", "inv5", 5),
+            createUserEvent("env6", "content 6", "inv6", 6),
+            createUserEvent("env7-1", "content 7-1", "inv7", 7),
+            createUserEvent("env7-2", "content 7-2", "inv8", 8),
+            createUserEvent("env9", "content 9", "inv9", 9),
+            createCompactedEvent(6, 9, "Summary 6-9"),
+            createUserEvent("env10", "content 10", "inv10", 10));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("Summary 1-4", "content 5", "Summary 6-9", "content 10");
+  }
+
+  @Test
+  public void processRequest_compactionWithUncompactedEventsBetween() {
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("e1", "content 1", "inv1", 1),
+            createUserEvent("e2", "content 2", "inv2", 2),
+            createUserEvent("e3", "content 3", "inv3", 3),
+            createCompactedEvent(1, 2, "Summary 1-2"));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("content 3", "Summary 1-2");
+  }
+
+  @Test
+  public void processRequest_rollingSummary_removesRedundancy() {
+    // Scenario: Rolling summary where a later summary covers a superset of the time range.
+    // Input: [E1(1), C1(Cover 1-1), E3(3), C2(Cover 1-3)]
+    // Expected: [C2]
+    // Explanation: C2 covers the range [1, 3], which includes the range covered by C1 [1, 1].
+    // Therefore, C1 is redundant. E1 and E3 are also covered by C2.
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("e1", "E1", "inv1", 1),
+            createCompactedEvent(1, 1, "C1"),
+            createUserEvent("e3", "E3", "inv3", 3),
+            createCompactedEvent(1, 3, "C2"));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("C2");
+  }
+
+  @Test
+  public void processRequest_rollingSummaryWithRetention() {
+    // Input: with retention size 3: [E1, E2, E3, E4, C1(Cover 1-1), E6, E7, C2(Cover 1-3), E9]
+    // Expected: [C2, E4, E6, E7, E9]
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("e1", "E1", "inv1", 1),
+            createUserEvent("e2", "E2", "inv2", 2),
+            createUserEvent("e3", "E3", "inv3", 3),
+            createUserEvent("e4", "E4", "inv4", 4),
+            createCompactedEvent(1, 1, "C1"),
+            createUserEvent("e6", "E6", "inv6", 6),
+            createUserEvent("e7", "E7", "inv7", 7),
+            createCompactedEvent(1, 3, "C2"),
+            createUserEvent("e9", "E9", "inv9", 9));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("C2", "E4", "E6", "E7", "E9");
+  }
+
+  @Test
+  public void processRequest_rollingSummary_preservesUncoveredHistory() {
+    // Input: [E1(1), E2(2), E3(3), E4(4), C1(2-2), E6(6), E7(7), C2(2-3), E9(9)]
+    // Expected: [E1, C2, E4, E6, E7, E9]
+    // E1 is before C1/C2 range, so it is preserved.
+    // C1 (2-2) is covered by C2 (2-3), so C1 is removed.
+    // E2, E3 are covered by C2.
+    // E4, E6, E7, E9 are retained.
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("e1", "E1", "inv1", 1),
+            createUserEvent("e2", "E2", "inv2", 2),
+            createUserEvent("e3", "E3", "inv3", 3),
+            createUserEvent("e4", "E4", "inv4", 4),
+            createCompactedEvent(2, 2, "C1"),
+            createUserEvent("e6", "E6", "inv6", 6),
+            createUserEvent("e7", "E7", "inv7", 7),
+            createCompactedEvent(2, 3, "C2"),
+            createUserEvent("e9", "E9", "inv9", 9));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("E1", "C2", "E4", "E6", "E7", "E9");
+  }
+
+  @Test
+  public void processRequest_slidingWindow_preservesOverlappingCompactions() {
+    // Case 1: Sliding Window + Retention
+    // Input: [E1(1), E2(2), E3(3), C1(1-2), E4(5), C2(2-3), E5(7)]
+    // Overlap: C1 and C2 overlap at 2. C1 is NOT redundant (start 1 < start 2).
+    // Expected: [C1, C2, E4, E5]
+    // E1(1) covered by C1.
+    // E2(2) covered by C1 (and C2).
+    // E3(3) covered by C2.
+    // E4(5) retained.
+    // E5(7) retained.
+    ImmutableList<Event> events =
+        ImmutableList.of(
+            createUserEvent("e1", "E1", "inv1", 1),
+            createUserEvent("e2", "E2", "inv2", 2),
+            createUserEvent("e3", "E3", "inv3", 3),
+            createCompactedEvent(1, 2, "C1"),
+            createUserEvent("e4", "E4", "inv4", 5),
+            createCompactedEvent(2, 3, "C2"),
+            createUserEvent("e5", "E5", "inv5", 7));
+
+    List<Content> contents = runContentsProcessor(events);
+    assertThat(contents)
+        .comparingElementsUsing(
+            transforming((Content c) -> c.parts().get().get(0).text().get(), "content text"))
+        .containsExactly("C1", "C2", "E4", "E5");
+  }
+
   private static Event createUserEvent(String id, String text) {
     return Event.builder()
         .id(id)
         .author(USER)
         .content(Optional.of(Content.fromParts(Part.fromText(text))))
         .invocationId("invocationId")
+        .build();
+  }
+
+  private static Event createUserEvent(
+      String id, String text, String invocationId, long timestamp) {
+    return Event.builder()
+        .id(id)
+        .author(USER)
+        .content(Optional.of(Content.fromParts(Part.fromText(text))))
+        .invocationId(invocationId)
+        .timestamp(timestamp)
         .build();
   }
 
@@ -639,14 +836,11 @@ public final class ContentsTest {
             .events(new ArrayList<>(events))
             .build();
     InvocationContext context =
-        InvocationContext.create(
-            new InMemorySessionService(),
-            new InMemoryArtifactService(),
-            "test-invocation",
-            agent,
-            session,
-            /* userContent= */ null,
-            RunConfig.builder().build());
+        InvocationContext.builder()
+            .invocationId("test-invocation")
+            .agent(agent)
+            .session(session)
+            .build();
 
     LlmRequest initialRequest = LlmRequest.builder().build();
     RequestProcessor.RequestProcessingResult result =
@@ -671,14 +865,11 @@ public final class ContentsTest {
             .events(new ArrayList<>(events))
             .build();
     InvocationContext context =
-        InvocationContext.create(
-            new InMemorySessionService(),
-            new InMemoryArtifactService(),
-            "test-invocation",
-            agent,
-            session,
-            /* userContent= */ null,
-            RunConfig.builder().build());
+        InvocationContext.builder()
+            .invocationId("test-invocation")
+            .agent(agent)
+            .session(session)
+            .build();
 
     LlmRequest initialRequest = LlmRequest.builder().build();
     RequestProcessor.RequestProcessingResult result =
@@ -692,5 +883,23 @@ public final class ContentsTest {
         .filter(Objects::nonNull)
         .map(Optional::get)
         .collect(toImmutableList());
+  }
+
+  private Event createCompactedEvent(long startTimestamp, long endTimestamp, String content) {
+    return Event.builder()
+        .actions(
+            EventActions.builder()
+                .compaction(
+                    EventCompaction.builder()
+                        .startTimestamp(startTimestamp)
+                        .endTimestamp(endTimestamp)
+                        .compactedContent(
+                            Content.builder()
+                                .role("model")
+                                .parts(Part.builder().text(content).build())
+                                .build())
+                        .build())
+                .build())
+        .build();
   }
 }

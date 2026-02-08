@@ -26,10 +26,19 @@ import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.google.adk.agents.Callbacks.AfterModelCallback;
+import com.google.adk.agents.Callbacks.AfterToolCallback;
+import com.google.adk.agents.Callbacks.BeforeModelCallback;
+import com.google.adk.agents.Callbacks.BeforeToolCallback;
+import com.google.adk.agents.Callbacks.OnModelErrorCallback;
+import com.google.adk.agents.Callbacks.OnToolErrorCallback;
 import com.google.adk.events.Event;
 import com.google.adk.models.LlmRegistry;
+import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.models.Model;
+import com.google.adk.sessions.InMemorySessionService;
+import com.google.adk.sessions.Session;
 import com.google.adk.testing.TestLlm;
 import com.google.adk.testing.TestUtils.EchoTool;
 import com.google.adk.tools.BaseTool;
@@ -39,9 +48,11 @@ import com.google.genai.types.Content;
 import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.Part;
 import com.google.genai.types.Schema;
+import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -94,6 +105,25 @@ public final class LlmAgentTest {
 
     assertThat(events.get(0).actions().stateDelta())
         .containsEntry("myMultiPartOutput", "Part 1. Part 2.");
+  }
+
+  @Test
+  public void testRun_withOutputKey_savesState_ignoresThoughts() {
+    Content modelContent =
+        Content.fromParts(
+            Part.fromText("Saved output"),
+            Part.fromText("Ignored thought").toBuilder().thought(true).build());
+    TestLlm testLlm = createTestLlm(createLlmResponse(modelContent));
+    LlmAgent agent = createTestAgentBuilder(testLlm).outputKey("myOutput").build();
+    InvocationContext invocationContext = createInvocationContext(agent);
+
+    List<Event> events = agent.runAsync(invocationContext).toList().blockingGet();
+
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).content()).hasValue(modelContent);
+    assertThat(events.get(0).finalResponse()).isTrue();
+
+    assertThat(events.get(0).actions().stateDelta()).containsEntry("myOutput", "Saved output");
   }
 
   @Test
@@ -296,11 +326,119 @@ public final class LlmAgentTest {
   public void resolveModel_withModelName_resolvesFromRegistry() {
     String modelName = "test-model";
     TestLlm testLlm = createTestLlm(LlmResponse.builder().build());
-    LlmRegistry.registerLlm(modelName, (name) -> testLlm);
+    LlmRegistry.registerLlm(modelName, (unusedName) -> testLlm);
     LlmAgent agent = createTestAgentBuilder(testLlm).model(modelName).build();
     Model resolvedModel = agent.resolvedModel();
 
     assertThat(resolvedModel.modelName()).hasValue(modelName);
     assertThat(resolvedModel.model()).hasValue(testLlm);
+  }
+
+  @Test
+  public void canonicalCallbacks_returnsEmptyListWhenNull() {
+    TestLlm testLlm = createTestLlm(LlmResponse.builder().build());
+    LlmAgent agent = createTestAgent(testLlm);
+
+    assertThat(agent.canonicalBeforeModelCallbacks()).isEmpty();
+    assertThat(agent.canonicalAfterModelCallbacks()).isEmpty();
+    assertThat(agent.canonicalOnModelErrorCallbacks()).isEmpty();
+    assertThat(agent.canonicalBeforeToolCallbacks()).isEmpty();
+    assertThat(agent.canonicalAfterToolCallbacks()).isEmpty();
+    assertThat(agent.canonicalOnToolErrorCallbacks()).isEmpty();
+
+    assertThat(agent.beforeModelCallback()).isEmpty();
+    assertThat(agent.afterModelCallback()).isEmpty();
+    assertThat(agent.onModelErrorCallback()).isEmpty();
+    assertThat(agent.beforeToolCallback()).isEmpty();
+    assertThat(agent.afterToolCallback()).isEmpty();
+    assertThat(agent.onToolErrorCallback()).isEmpty();
+  }
+
+  @Test
+  public void canonicalCallbacks_returnsListWhenPresent() {
+    BeforeModelCallback bmc = (unusedCtx, unusedReq) -> Maybe.empty();
+    AfterModelCallback amc = (unusedCtx, unusedRes) -> Maybe.empty();
+    OnModelErrorCallback omec = (unusedCtx, unusedReq, unusedErr) -> Maybe.empty();
+    BeforeToolCallback btc = (unusedInvCtx, unusedTool, unusedArgs, unusedToolCtx) -> Maybe.empty();
+    AfterToolCallback atc =
+        (unusedInvCtx, unusedTool, unusedArgs, unusedToolCtx, unusedRes) -> Maybe.empty();
+    OnToolErrorCallback otec =
+        (unusedInvCtx, unusedTool, unusedArgs, unusedToolCtx, unusedErr) -> Maybe.empty();
+
+    TestLlm testLlm = createTestLlm(LlmResponse.builder().build());
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .beforeModelCallback(ImmutableList.of(bmc))
+            .afterModelCallback(ImmutableList.of(amc))
+            .onModelErrorCallback(ImmutableList.of(omec))
+            .beforeToolCallback(ImmutableList.of(btc))
+            .afterToolCallback(ImmutableList.of(atc))
+            .onToolErrorCallback(ImmutableList.of(otec))
+            .build();
+
+    assertThat(agent.canonicalBeforeModelCallbacks()).containsExactly(bmc);
+    assertThat(agent.canonicalAfterModelCallbacks()).containsExactly(amc);
+    assertThat(agent.canonicalOnModelErrorCallbacks()).containsExactly(omec);
+    assertThat(agent.canonicalBeforeToolCallbacks()).containsExactly(btc);
+    assertThat(agent.canonicalAfterToolCallbacks()).containsExactly(atc);
+    assertThat(agent.canonicalOnToolErrorCallbacks()).containsExactly(otec);
+
+    assertThat(agent.beforeModelCallback()).containsExactly(bmc);
+    assertThat(agent.afterModelCallback()).containsExactly(amc);
+    assertThat(agent.onModelErrorCallback()).containsExactly(omec);
+    assertThat(agent.beforeToolCallback()).containsExactly(btc);
+    assertThat(agent.afterToolCallback()).containsExactly(atc);
+    assertThat(agent.onToolErrorCallback()).containsExactly(otec);
+  }
+
+  @Test
+  public void run_sequentialAgents_shareTempStateViaSession() {
+    // 1. Setup Session Service and Session
+    InMemorySessionService sessionService = new InMemorySessionService();
+    Session session =
+        sessionService
+            .createSession("app", "user", new ConcurrentHashMap<>(), "session1")
+            .blockingGet();
+
+    // 2. Agent 1: runs and produces output "value1" to state "temp:key1"
+    Content model1Content = Content.fromParts(Part.fromText("value1"));
+    TestLlm testLlm1 = createTestLlm(createLlmResponse(model1Content));
+    LlmAgent agent1 =
+        createTestAgentBuilder(testLlm1).name("agent1").outputKey("temp:key1").build();
+    InvocationContext invocationContext1 = createInvocationContext(agent1, sessionService, session);
+
+    List<Event> events1 = agent1.runAsync(invocationContext1).toList().blockingGet();
+    assertThat(events1).hasSize(1);
+    Event event1 = events1.get(0);
+    assertThat(event1.actions()).isNotNull();
+    assertThat(event1.actions().stateDelta()).containsEntry("temp:key1", "value1");
+
+    // 3. Simulate orchestrator: append event1 to session, updating its state
+    var unused = sessionService.appendEvent(session, event1).blockingGet();
+    assertThat(session.state()).containsEntry("temp:key1", "value1");
+
+    // 4. Agent 2: uses Instruction.Provider to read "temp:key1" from session state
+    // and generates an instruction based on it.
+    TestLlm testLlm2 =
+        createTestLlm(createLlmResponse(Content.fromParts(Part.fromText("response2"))));
+    LlmAgent agent2 =
+        createTestAgentBuilder(testLlm2)
+            .name("agent2")
+            .instruction(
+                new Instruction.Provider(
+                    ctx ->
+                        Single.just(
+                            "Instruction for Agent2 based on Agent1 output: "
+                                + ctx.state().get("temp:key1"))))
+            .build();
+    InvocationContext invocationContext2 = createInvocationContext(agent2, sessionService, session);
+    List<Event> events2 = agent2.runAsync(invocationContext2).toList().blockingGet();
+    assertThat(events2).hasSize(1);
+
+    // 5. Verify that agent2's LLM received an instruction containing agent1's output
+    assertThat(testLlm2.getRequests()).hasSize(1);
+    LlmRequest request2 = testLlm2.getRequests().get(0);
+    assertThat(request2.getFirstSystemInstruction().get())
+        .contains("Instruction for Agent2 based on Agent1 output: value1");
   }
 }
