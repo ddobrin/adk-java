@@ -135,7 +135,7 @@ public class PlannerAgent extends BaseAgent {
               .id(Event.generateEventId())
               .invocationId(invocationContext.invocationId())
               .author(name())
-              .branch(invocationContext.branch())
+              .branch(invocationContext.branch().orElse(null))
               .content(Content.fromParts(Part.fromText(doneWithResult.result())))
               .actions(EventActions.builder().build())
               .build();
