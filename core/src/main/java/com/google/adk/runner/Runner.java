@@ -340,7 +340,7 @@ public class Runner {
             .id(Event.generateEventId())
             .invocationId(invocationContext.invocationId())
             .author("user")
-            .content(Optional.of(newMessage));
+            .content(newMessage);
 
     // Add state delta if provided
     if (stateDelta != null && !stateDelta.isEmpty()) {
@@ -540,7 +540,7 @@ public class Runner {
                         .id(Event.generateEventId())
                         .invocationId(contextWithUpdatedSession.invocationId())
                         .author("model")
-                        .content(Optional.of(content))
+                        .content(content)
                         .build());
 
     // Agent execution
@@ -568,7 +568,7 @@ public class Runner {
         .toFlowable()
         .switchIfEmpty(agentEvents)
         .concatWith(
-            Completable.defer(() -> pluginManager.runAfterRunCallback(contextWithUpdatedSession)))
+            Completable.defer(() -> pluginManager.afterRunCallback(contextWithUpdatedSession)))
         .concatWith(Completable.defer(() -> compactEvents(updatedSession)));
   }
 

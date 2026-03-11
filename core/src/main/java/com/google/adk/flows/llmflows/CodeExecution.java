@@ -159,8 +159,7 @@ public final class CodeExecution {
         InvocationContext invocationContext, LlmResponse llmResponse) {
       if (llmResponse.partial().orElse(false)) {
         return Single.just(
-            ResponseProcessor.ResponseProcessingResult.create(
-                llmResponse, ImmutableList.of(), Optional.empty()));
+            ResponseProcessor.ResponseProcessingResult.create(llmResponse, ImmutableList.of()));
       }
       var llmResponseBuilder = llmResponse.toBuilder();
       return runPostProcessor(invocationContext, llmResponseBuilder)
@@ -168,7 +167,7 @@ public final class CodeExecution {
           .map(
               events ->
                   ResponseProcessor.ResponseProcessingResult.create(
-                      llmResponseBuilder.build(), events, Optional.empty()));
+                      llmResponseBuilder.build(), events));
     }
   }
 
@@ -229,7 +228,7 @@ public final class CodeExecution {
                   Event.builder()
                       .invocationId(invocationContext.invocationId())
                       .author(llmAgent.name())
-                      .content(Optional.of(codeContent))
+                      .content(codeContent)
                       .build();
 
               return Flowable.defer(
@@ -309,7 +308,7 @@ public final class CodeExecution {
         Event.builder()
             .invocationId(invocationContext.invocationId())
             .author(llmAgent.name())
-            .content(Optional.of(responseContent))
+            .content(responseContent)
             .actions(EventActions.builder().build())
             .build();
 
@@ -456,7 +455,7 @@ public final class CodeExecution {
               return Event.builder()
                   .invocationId(invocationContext.invocationId())
                   .author(invocationContext.agent().name())
-                  .content(Optional.of(resultContent))
+                  .content(resultContent)
                   .actions(eventActionsBuilder.build())
                   .build();
             });
