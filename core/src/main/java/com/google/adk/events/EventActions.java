@@ -83,11 +83,11 @@ public class EventActions extends JsonBaseModel {
   }
 
   @JsonProperty("stateDelta")
-  public ConcurrentMap<String, Object> stateDelta() {
+  public Map<String, Object> stateDelta() {
     return stateDelta;
   }
 
-  @Deprecated // Use stateDelta(), addState() and removeStateByKey() instead.
+  @Deprecated // Use stateDelta() and removeStateByKey() instead.
   public void setStateDelta(ConcurrentMap<String, Object> stateDelta) {
     this.stateDelta = stateDelta;
   }
