@@ -18,8 +18,12 @@ package com.google.adk.planner.goap;
 
 import com.google.common.collect.ImmutableList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -54,6 +58,75 @@ public final class DependencyGraphSearch {
     resolve(graph, goal, satisfied, visiting, executionOrder);
 
     return ImmutableList.copyOf(executionOrder);
+  }
+
+  /**
+   * Groups agents into parallelizable execution levels.
+   *
+   * <p>Each group contains agents whose dependencies are all satisfied by agents in earlier groups
+   * or by initial preconditions. Agents within the same group are independent and can run in
+   * parallel.
+   *
+   * @param graph the dependency graph
+   * @param metadata agent metadata used to compute dependency levels
+   * @param preconditions state keys already available
+   * @param goal the target output key
+   * @return ordered list of agent groups; agents within each group can run in parallel
+   * @throws IllegalStateException if a dependency cannot be resolved or a cycle is detected
+   */
+  public static ImmutableList<ImmutableList<String>> searchGrouped(
+      GoalOrientedSearchGraph graph,
+      List<AgentMetadata> metadata,
+      Collection<String> preconditions,
+      String goal) {
+
+    ImmutableList<String> flatOrder = search(graph, preconditions, goal);
+
+    if (flatOrder.isEmpty()) {
+      return ImmutableList.of();
+    }
+
+    Map<String, AgentMetadata> agentToMeta = new HashMap<>();
+    for (AgentMetadata m : metadata) {
+      agentToMeta.put(m.agentName(), m);
+    }
+
+    // Assign execution levels: level = 1 + max(level of dependency agents).
+    // Agents at the same level have no mutual dependencies and can run in parallel.
+    Set<String> preconSet = new HashSet<>(preconditions);
+    Map<String, Integer> agentLevel = new LinkedHashMap<>();
+
+    for (String agentName : flatOrder) {
+      AgentMetadata meta = agentToMeta.get(agentName);
+      int maxDepLevel = -1;
+
+      for (String inputKey : meta.inputKeys()) {
+        if (preconSet.contains(inputKey)) {
+          continue;
+        }
+        String producerAgent = graph.getProducerAgent(inputKey);
+        if (producerAgent != null && agentLevel.containsKey(producerAgent)) {
+          maxDepLevel = Math.max(maxDepLevel, agentLevel.get(producerAgent));
+        }
+      }
+
+      agentLevel.put(agentName, maxDepLevel + 1);
+    }
+
+    int maxLevel = agentLevel.values().stream().mapToInt(Integer::intValue).max().orElse(0);
+    ImmutableList.Builder<ImmutableList<String>> groups = ImmutableList.builder();
+    for (int level = 0; level <= maxLevel; level++) {
+      final int l = level;
+      ImmutableList<String> group =
+          flatOrder.stream()
+              .filter(name -> agentLevel.get(name) == l)
+              .collect(ImmutableList.toImmutableList());
+      if (!group.isEmpty()) {
+        groups.add(group);
+      }
+    }
+
+    return groups.build();
   }
 
   private static void resolve(

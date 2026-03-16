@@ -23,7 +23,6 @@ import com.google.adk.agents.PlanningContext;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Single;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +43,8 @@ import org.slf4j.LoggerFactory;
  *   Agent D: inputs=["person", "horoscope"], output="writeup"
  *   Goal: "writeup"
  *
- *   Resolved path: A → B → C → D
+ *   Resolved groups: [A, B] → [C] → [D]
+ *   (A and B are independent and run in parallel)
  * </pre>
  */
 public final class GoalOrientedPlanner implements Planner {
@@ -53,8 +53,9 @@ public final class GoalOrientedPlanner implements Planner {
 
   private final String goal;
   private final List<AgentMetadata> metadata;
-  private ImmutableList<BaseAgent> executionPath;
-  private final AtomicInteger cursor = new AtomicInteger(0);
+  // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
+  private ImmutableList<ImmutableList<BaseAgent>> executionGroups;
+  private int cursor;
 
   public GoalOrientedPlanner(String goal, List<AgentMetadata> metadata) {
     this.goal = goal;
@@ -64,19 +65,23 @@ public final class GoalOrientedPlanner implements Planner {
   @Override
   public void init(PlanningContext context) {
     GoalOrientedSearchGraph graph = new GoalOrientedSearchGraph(metadata);
-    ImmutableList<String> agentOrder =
-        DependencyGraphSearch.search(graph, context.state().keySet(), goal);
+    ImmutableList<ImmutableList<String>> agentGroups =
+        DependencyGraphSearch.searchGrouped(graph, metadata, context.state().keySet(), goal);
 
-    logger.info("GoalOrientedPlanner resolved execution order: {}", agentOrder);
+    logger.info("GoalOrientedPlanner resolved execution groups: {}", agentGroups);
 
-    executionPath =
-        agentOrder.stream().map(context::findAgent).collect(ImmutableList.toImmutableList());
-    cursor.set(0);
+    executionGroups =
+        agentGroups.stream()
+            .map(
+                group ->
+                    group.stream().map(context::findAgent).collect(ImmutableList.toImmutableList()))
+            .collect(ImmutableList.toImmutableList());
+    cursor = 0;
   }
 
   @Override
   public Single<PlannerAction> firstAction(PlanningContext context) {
-    cursor.set(0);
+    cursor = 0;
     return selectNext();
   }
 
@@ -86,10 +91,10 @@ public final class GoalOrientedPlanner implements Planner {
   }
 
   private Single<PlannerAction> selectNext() {
-    int idx = cursor.getAndIncrement();
-    if (executionPath == null || idx >= executionPath.size()) {
+    if (executionGroups == null || cursor >= executionGroups.size()) {
       return Single.just(new PlannerAction.Done());
     }
-    return Single.just(new PlannerAction.RunAgents(executionPath.get(idx)));
+    ImmutableList<BaseAgent> group = executionGroups.get(cursor++);
+    return Single.just(new PlannerAction.RunAgents(group));
   }
 }

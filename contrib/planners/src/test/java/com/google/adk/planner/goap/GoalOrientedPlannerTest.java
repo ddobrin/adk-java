@@ -203,6 +203,108 @@ class GoalOrientedPlannerTest {
     assertThat(second).isInstanceOf(PlannerAction.Done.class);
   }
 
+  @Test
+  void dependencyGraphSearch_detectsCycle() {
+    // A depends on B's output, B depends on A's output → cycle
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of("outputB"), "outputA"),
+            new AgentMetadata("agentB", ImmutableList.of("outputA"), "outputB"));
+
+    GoalOrientedSearchGraph graph = new GoalOrientedSearchGraph(metadata);
+
+    IllegalStateException ex =
+        assertThrows(
+            IllegalStateException.class,
+            () -> DependencyGraphSearch.search(graph, List.of(), "outputA"));
+    assertThat(ex.getMessage()).contains("Circular dependency");
+  }
+
+  @Test
+  void dependencyGraphSearch_goalAlreadyInPreconditions() {
+    List<AgentMetadata> metadata =
+        List.of(new AgentMetadata("agentA", ImmutableList.of(), "outputA"));
+
+    GoalOrientedSearchGraph graph = new GoalOrientedSearchGraph(metadata);
+    ImmutableList<String> path = DependencyGraphSearch.search(graph, List.of("outputA"), "outputA");
+
+    assertThat(path).isEmpty();
+  }
+
+  @Test
+  void goalOrientedSearchGraph_rejectsDuplicateOutputKeys() {
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of(), "sameOutput"),
+            new AgentMetadata("agentB", ImmutableList.of(), "sameOutput"));
+
+    assertThrows(IllegalArgumentException.class, () -> new GoalOrientedSearchGraph(metadata));
+  }
+
+  @Test
+  void planningContext_findAgentThrowsOnUnknownName() {
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    PlanningContext context =
+        createPlanningContext(ImmutableList.of(agentA), new ConcurrentHashMap<>());
+
+    IllegalArgumentException ex =
+        assertThrows(IllegalArgumentException.class, () -> context.findAgent("nonexistent"));
+    assertThat(ex.getMessage()).contains("nonexistent");
+  }
+
+  @Test
+  void goalOrientedPlanner_groupsIndependentAgentsInParallel() {
+    // personExtractor and signExtractor are independent → should be in same RunAgents group
+    SimpleTestAgent personExtractor = new SimpleTestAgent("personExtractor");
+    SimpleTestAgent signExtractor = new SimpleTestAgent("signExtractor");
+    SimpleTestAgent horoscopeGenerator = new SimpleTestAgent("horoscopeGenerator");
+    SimpleTestAgent writer = new SimpleTestAgent("writer");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("personExtractor", ImmutableList.of("prompt"), "person"),
+            new AgentMetadata("signExtractor", ImmutableList.of("prompt"), "sign"),
+            new AgentMetadata(
+                "horoscopeGenerator", ImmutableList.of("person", "sign"), "horoscope"),
+            new AgentMetadata("writer", ImmutableList.of("person", "horoscope"), "writeup"));
+
+    GoalOrientedPlanner planner = new GoalOrientedPlanner("writeup", metadata);
+    ImmutableList<BaseAgent> agents =
+        ImmutableList.of(personExtractor, signExtractor, horoscopeGenerator, writer);
+
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    state.put("prompt", "My name is Mario and my zodiac sign is pisces");
+
+    PlanningContext context = createPlanningContext(agents, state);
+    planner.init(context);
+
+    // First action: both extractors in parallel (same group)
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+    PlannerAction.RunAgents firstRun = (PlannerAction.RunAgents) first;
+    assertThat(firstRun.agents()).hasSize(2);
+    List<String> firstNames = firstRun.agents().stream().map(BaseAgent::name).toList();
+    assertThat(firstNames).containsExactly("personExtractor", "signExtractor");
+
+    // Second action: horoscopeGenerator alone
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.RunAgents.class);
+    PlannerAction.RunAgents secondRun = (PlannerAction.RunAgents) second;
+    assertThat(secondRun.agents()).hasSize(1);
+    assertThat(secondRun.agents().get(0).name()).isEqualTo("horoscopeGenerator");
+
+    // Third action: writer alone
+    PlannerAction third = planner.nextAction(context).blockingGet();
+    assertThat(third).isInstanceOf(PlannerAction.RunAgents.class);
+    PlannerAction.RunAgents thirdRun = (PlannerAction.RunAgents) third;
+    assertThat(thirdRun.agents()).hasSize(1);
+    assertThat(thirdRun.agents().get(0).name()).isEqualTo("writer");
+
+    // Fourth action: Done
+    PlannerAction fourth = planner.nextAction(context).blockingGet();
+    assertThat(fourth).isInstanceOf(PlannerAction.Done.class);
+  }
+
   private static PlanningContext createPlanningContext(
       ImmutableList<BaseAgent> agents, ConcurrentHashMap<String, Object> state) {
     // Create a minimal InvocationContext for testing

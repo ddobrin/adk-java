@@ -16,14 +16,12 @@
 
 package com.google.adk.agents;
 
-import static com.google.adk.testing.TestUtils.createEvent;
-import static com.google.adk.testing.TestUtils.createInvocationContext;
-import static com.google.adk.testing.TestUtils.createSubAgent;
 import static com.google.common.truth.Truth.assertThat;
 
 import com.google.adk.events.Event;
 import com.google.adk.events.EventActions;
 import com.google.adk.testing.TestBaseAgent;
+import com.google.adk.testing.TestUtils;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Single;
@@ -39,7 +37,7 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_withDone_stopsImmediately() {
-    TestBaseAgent subAgent = createSubAgent("sub", createEvent("e1"));
+    TestBaseAgent subAgent = TestUtils.createSubAgent("sub", TestUtils.createEvent("e1"));
     Planner donePlanner =
         new Planner() {
           @Override
@@ -56,7 +54,7 @@ public final class PlannerAgentTest {
     PlannerAgent agent =
         PlannerAgent.builder().name("planner").subAgents(subAgent).planner(donePlanner).build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).isEmpty();
@@ -64,7 +62,7 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_withDoneWithResult_emitsResultEvent() {
-    TestBaseAgent subAgent = createSubAgent("sub");
+    TestBaseAgent subAgent = TestUtils.createSubAgent("sub");
     Planner resultPlanner =
         new Planner() {
           @Override
@@ -81,7 +79,7 @@ public final class PlannerAgentTest {
     PlannerAgent agent =
         PlannerAgent.builder().name("planner").subAgents(subAgent).planner(resultPlanner).build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).hasSize(1);
@@ -90,8 +88,8 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_withNoOp_skipsAndContinues() {
-    Event event1 = createEvent("e1");
-    TestBaseAgent subAgent = createSubAgent("sub", event1);
+    Event event1 = TestUtils.createEvent("e1");
+    TestBaseAgent subAgent = TestUtils.createSubAgent("sub", event1);
 
     AtomicInteger callCount = new AtomicInteger(0);
     Planner noOpThenRunPlanner =
@@ -118,7 +116,7 @@ public final class PlannerAgentTest {
             .planner(noOpThenRunPlanner)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).containsExactly(event1);
@@ -126,7 +124,8 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_withMaxIterations_stopsAtLimit() {
-    TestBaseAgent subAgent = createSubAgent("sub", () -> Flowable.just(createEvent("e")));
+    TestBaseAgent subAgent =
+        TestUtils.createSubAgent("sub", () -> Flowable.just(TestUtils.createEvent("e")));
 
     Planner alwaysRunPlanner =
         new Planner() {
@@ -149,7 +148,7 @@ public final class PlannerAgentTest {
             .maxIterations(3)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     // 3 iterations: first + 2 next calls, each producing 1 event
@@ -158,12 +157,12 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_sequentialPlannerPattern() {
-    Event event1 = createEvent("e1");
-    Event event2 = createEvent("e2");
-    Event event3 = createEvent("e3");
-    TestBaseAgent agentA = createSubAgent("agentA", event1);
-    TestBaseAgent agentB = createSubAgent("agentB", event2);
-    TestBaseAgent agentC = createSubAgent("agentC", event3);
+    Event event1 = TestUtils.createEvent("e1");
+    Event event2 = TestUtils.createEvent("e2");
+    Event event3 = TestUtils.createEvent("e3");
+    TestBaseAgent agentA = TestUtils.createSubAgent("agentA", event1);
+    TestBaseAgent agentB = TestUtils.createSubAgent("agentB", event2);
+    TestBaseAgent agentC = TestUtils.createSubAgent("agentC", event3);
 
     AtomicInteger cursor = new AtomicInteger(0);
     ImmutableList<String> order = ImmutableList.of("agentA", "agentB", "agentC");
@@ -196,7 +195,7 @@ public final class PlannerAgentTest {
             .planner(seqPlanner)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).containsExactly(event1, event2, event3).inOrder();
@@ -204,10 +203,10 @@ public final class PlannerAgentTest {
 
   @Test
   public void runAsync_withParallelRunAgents_runsMultipleAgents() {
-    Event event1 = createEvent("e1");
-    Event event2 = createEvent("e2");
-    TestBaseAgent agentA = createSubAgent("agentA", event1);
-    TestBaseAgent agentB = createSubAgent("agentB", event2);
+    Event event1 = TestUtils.createEvent("e1");
+    Event event2 = TestUtils.createEvent("e2");
+    TestBaseAgent agentA = TestUtils.createSubAgent("agentA", event1);
+    TestBaseAgent agentB = TestUtils.createSubAgent("agentB", event2);
 
     Planner parallelPlanner =
         new Planner() {
@@ -229,7 +228,7 @@ public final class PlannerAgentTest {
             .planner(parallelPlanner)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).containsExactly(event1, event2);
@@ -257,7 +256,7 @@ public final class PlannerAgentTest {
             .planner(planner)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     assertThat(events).isEmpty();
@@ -265,7 +264,7 @@ public final class PlannerAgentTest {
 
   @Test(expected = IllegalStateException.class)
   public void builder_withoutPlanner_throwsIllegalState() {
-    TestBaseAgent subAgent = createSubAgent("sub");
+    TestBaseAgent subAgent = TestUtils.createSubAgent("sub");
     PlannerAgent.builder().name("planner").subAgents(subAgent).build();
   }
 
@@ -273,7 +272,7 @@ public final class PlannerAgentTest {
   public void runAsync_stateIsSharedAcrossAgents() {
     // Agent A writes to state, Agent B reads from state
     Event eventA =
-        createEvent("eA").toBuilder()
+        TestUtils.createEvent("eA").toBuilder()
             .actions(
                 EventActions.builder()
                     .stateDelta(
@@ -282,8 +281,8 @@ public final class PlannerAgentTest {
                     .build())
             .build();
 
-    TestBaseAgent agentA = createSubAgent("agentA", eventA);
-    TestBaseAgent agentB = createSubAgent("agentB", createEvent("eB"));
+    TestBaseAgent agentA = TestUtils.createSubAgent("agentA", eventA);
+    TestBaseAgent agentB = TestUtils.createSubAgent("agentB", TestUtils.createEvent("eB"));
 
     AtomicInteger cursor = new AtomicInteger(0);
     Planner seqPlanner =
@@ -314,7 +313,7 @@ public final class PlannerAgentTest {
             .planner(seqPlanner)
             .build();
 
-    InvocationContext ctx = createInvocationContext(agent);
+    InvocationContext ctx = TestUtils.createInvocationContext(agent);
     List<Event> events = agent.runAsync(ctx).toList().blockingGet();
 
     // Both events should be emitted

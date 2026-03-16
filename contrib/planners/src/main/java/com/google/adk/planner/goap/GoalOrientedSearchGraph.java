@@ -28,7 +28,7 @@ import java.util.List;
  *   <li>Each output key maps to the input keys (dependencies) required to produce it
  * </ul>
  *
- * <p>Used by {@link DependencyGraphSearch} for A* search.
+ * <p>Used by {@link DependencyGraphSearch} for backward-chaining dependency resolution.
  */
 public final class GoalOrientedSearchGraph {
 
