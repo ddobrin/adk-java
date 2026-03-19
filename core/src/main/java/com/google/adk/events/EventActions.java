@@ -157,9 +157,6 @@ public class EventActions extends JsonBaseModel {
       Map<String, ToolConfirmation> requestedToolConfirmations) {
     if (requestedToolConfirmations == null) {
       this.requestedToolConfirmations = new ConcurrentHashMap<>();
-    } else if (requestedToolConfirmations instanceof ConcurrentMap) {
-      this.requestedToolConfirmations =
-          (ConcurrentMap<String, ToolConfirmation>) requestedToolConfirmations;
     } else {
       this.requestedToolConfirmations = new ConcurrentHashMap<>(requestedToolConfirmations);
     }
@@ -287,15 +284,23 @@ public class EventActions extends JsonBaseModel {
 
     @CanIgnoreReturnValue
     @JsonProperty("stateDelta")
-    public Builder stateDelta(ConcurrentMap<String, Object> value) {
-      this.stateDelta = value;
+    public Builder stateDelta(@Nullable Map<String, Object> value) {
+      if (value == null) {
+        this.stateDelta = new ConcurrentHashMap<>();
+      } else {
+        this.stateDelta = new ConcurrentHashMap<>(value);
+      }
       return this;
     }
 
     @CanIgnoreReturnValue
     @JsonProperty("artifactDelta")
-    public Builder artifactDelta(Map<String, Integer> value) {
-      this.artifactDelta = new ConcurrentHashMap<>(value);
+    public Builder artifactDelta(@Nullable Map<String, Integer> value) {
+      if (value == null) {
+        this.artifactDelta = new ConcurrentHashMap<>();
+      } else {
+        this.artifactDelta = new ConcurrentHashMap<>(value);
+      }
       return this;
     }
 
@@ -333,10 +338,6 @@ public class EventActions extends JsonBaseModel {
     public Builder requestedToolConfirmations(@Nullable Map<String, ToolConfirmation> value) {
       if (value == null) {
         this.requestedToolConfirmations = new ConcurrentHashMap<>();
-        return this;
-      }
-      if (value instanceof ConcurrentMap) {
-        this.requestedToolConfirmations = (ConcurrentMap<String, ToolConfirmation>) value;
       } else {
         this.requestedToolConfirmations = new ConcurrentHashMap<>(value);
       }
