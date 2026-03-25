@@ -26,6 +26,7 @@ import static com.google.adk.testing.TestUtils.simplifyEvents;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Arrays.stream;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
@@ -33,6 +34,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LiveRequestQueue;
 import com.google.adk.agents.LlmAgent;
@@ -43,6 +45,7 @@ import com.google.adk.events.Event;
 import com.google.adk.flows.llmflows.Functions;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.plugins.BasePlugin;
+import com.google.adk.sessions.BaseSessionService;
 import com.google.adk.sessions.Session;
 import com.google.adk.sessions.SessionKey;
 import com.google.adk.summarizer.EventsCompactionConfig;
@@ -851,6 +854,45 @@ public final class RunnerTest {
     assertThat(sessionInCallback.state()).containsEntry("number", 123);
   }
 
+  @Test
+  public void runAsync_ensureEventsAreAppendedInOrder() throws Exception {
+    Event event1 = TestUtils.createEvent("1");
+    Event event2 = TestUtils.createEvent("2");
+    BaseAgent mockAgent = TestUtils.createSubAgent("test agent", event1, event2);
+
+    BaseSessionService mockSessionService = mock(BaseSessionService.class);
+
+    when(mockSessionService.getSession(any(), any(), any(), any())).thenReturn(Maybe.just(session));
+    when(mockSessionService.appendEvent(any(), any()))
+        .thenAnswer(
+            invocation -> {
+              Event eventArg = invocation.getArgument(1);
+              Single<Event> result = Single.just(eventArg);
+              if (eventArg.id().equals("1")) {
+                // Artificially delay the first event to ensure it is appended first.
+                return result.delay(100, MILLISECONDS);
+              }
+              return result;
+            });
+
+    Runner mockRunner =
+        Runner.builder()
+            .agent(mockAgent)
+            .appName("test")
+            .sessionService(mockSessionService)
+            .build();
+
+    List<Event> results =
+        mockRunner
+            .runAsync("user", session.id(), createContent("user message"))
+            .toList()
+            .blockingGet();
+
+    assertThat(simplifyEvents(results))
+        .containsExactly("author: content for event 1", "author: content for event 2")
+        .inOrder();
+  }
+
   private Content createContent(String text) {
     return Content.builder().parts(Part.builder().text(text).build()).build();
   }
@@ -1019,21 +1061,16 @@ public final class RunnerTest {
 
     List<SpanData> spans = openTelemetryRule.getSpans();
     List<SpanData> llmSpans = spans.stream().filter(s -> s.getName().equals("call_llm")).toList();
-    List<SpanData> toolCallSpans =
-        spans.stream().filter(s -> s.getName().equals("tool_call [echo_tool]")).toList();
-    List<SpanData> toolResponseSpans =
-        spans.stream().filter(s -> s.getName().equals("tool_response [echo_tool]")).toList();
+    List<SpanData> toolSpans =
+        spans.stream().filter(s -> s.getName().equals("execute_tool [echo_tool]")).toList();
 
     assertThat(llmSpans).hasSize(2);
-    assertThat(toolCallSpans).hasSize(1);
-    assertThat(toolResponseSpans).hasSize(1);
+    assertThat(toolSpans).hasSize(1);
 
     List<String> llmSpanIds = llmSpans.stream().map(s -> s.getSpanContext().getSpanId()).toList();
-    String toolCallParentId = toolCallSpans.get(0).getParentSpanContext().getSpanId();
-    String toolResponseParentId = toolResponseSpans.get(0).getParentSpanContext().getSpanId();
+    String toolParentId = toolSpans.get(0).getParentSpanContext().getSpanId();
 
-    assertThat(toolCallParentId).isEqualTo(toolResponseParentId);
-    assertThat(llmSpanIds).contains(toolCallParentId);
+    assertThat(llmSpanIds).contains(toolParentId);
   }
 
   @Test
@@ -1059,22 +1096,17 @@ public final class RunnerTest {
 
     List<SpanData> spans = openTelemetryRule.getSpans();
     List<SpanData> llmSpans = spans.stream().filter(s -> s.getName().equals("call_llm")).toList();
-    List<SpanData> toolCallSpans =
-        spans.stream().filter(s -> s.getName().equals("tool_call [echo_tool]")).toList();
-    List<SpanData> toolResponseSpans =
-        spans.stream().filter(s -> s.getName().equals("tool_response [echo_tool]")).toList();
+    List<SpanData> toolSpans =
+        spans.stream().filter(s -> s.getName().equals("execute_tool [echo_tool]")).toList();
 
     // In runLive, there is one call_llm span for the execution
     assertThat(llmSpans).hasSize(1);
-    assertThat(toolCallSpans).hasSize(1);
-    assertThat(toolResponseSpans).hasSize(1);
+    assertThat(toolSpans).hasSize(1);
 
     List<String> llmSpanIds = llmSpans.stream().map(s -> s.getSpanContext().getSpanId()).toList();
-    String toolCallParentId = toolCallSpans.get(0).getParentSpanContext().getSpanId();
-    String toolResponseParentId = toolResponseSpans.get(0).getParentSpanContext().getSpanId();
+    String toolParentId = toolSpans.get(0).getParentSpanContext().getSpanId();
 
-    assertThat(toolCallParentId).isEqualTo(toolResponseParentId);
-    assertThat(llmSpanIds).contains(toolCallParentId);
+    assertThat(llmSpanIds).contains(toolParentId);
   }
 
   @Test
