@@ -17,7 +17,7 @@
 package com.google.adk.planner.p2p;
 
 import com.google.adk.planner.goap.AgentMetadata;
-import java.util.concurrent.ConcurrentMap;
+import java.util.Map;
 
 /**
  * Tracks activation state for a single agent in P2P planning.
@@ -41,7 +41,7 @@ final class AgentActivator {
   }
 
   /** Returns true if the agent can be activated given the current state. */
-  boolean canActivate(ConcurrentMap<String, Object> state) {
+  boolean canActivate(Map<String, Object> state) {
     return !executing
         && shouldExecute
         && metadata.inputKeys().stream().allMatch(state::containsKey);

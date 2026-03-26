@@ -26,8 +26,6 @@ import io.reactivex.rxjava3.core.Single;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,9 +59,10 @@ public final class P2PPlanner implements Planner {
 
   private final List<AgentMetadata> metadata;
   private final int maxInvocations;
-  private final BiPredicate<ConcurrentMap<String, Object>, Integer> exitCondition;
+  private final BiPredicate<Map<String, Object>, Integer> exitCondition;
   private Map<String, AgentActivator> activators;
-  private final AtomicInteger invocationCount = new AtomicInteger(0);
+  // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
+  private int invocationCount;
 
   /**
    * Creates a P2P planner with a custom exit condition.
@@ -75,7 +74,7 @@ public final class P2PPlanner implements Planner {
   public P2PPlanner(
       List<AgentMetadata> metadata,
       int maxInvocations,
-      BiPredicate<ConcurrentMap<String, Object>, Integer> exitCondition) {
+      BiPredicate<Map<String, Object>, Integer> exitCondition) {
     this.metadata = metadata;
     this.maxInvocations = maxInvocations;
     this.exitCondition = exitCondition;
@@ -92,7 +91,7 @@ public final class P2PPlanner implements Planner {
     for (AgentMetadata m : metadata) {
       activators.put(m.agentName(), new AgentActivator(m));
     }
-    invocationCount.set(0);
+    invocationCount = 0;
   }
 
   @Override
@@ -102,7 +101,7 @@ public final class P2PPlanner implements Planner {
 
   @Override
   public Single<PlannerAction> nextAction(PlanningContext context) {
-    int count = invocationCount.get();
+    int count = invocationCount;
 
     // Check exit condition
     if (exitCondition.test(context.state(), count)) {
@@ -128,7 +127,7 @@ public final class P2PPlanner implements Planner {
   }
 
   private Single<PlannerAction> findReadyAgents(PlanningContext context) {
-    if (invocationCount.get() >= maxInvocations) {
+    if (invocationCount >= maxInvocations) {
       logger.info("P2PPlanner reached maxInvocations={}", maxInvocations);
       return Single.just(new PlannerAction.Done());
     }
@@ -138,7 +137,7 @@ public final class P2PPlanner implements Planner {
       if (activator.canActivate(context.state())) {
         readyAgents.add(context.findAgent(activator.agentName()));
         activator.startExecution();
-        invocationCount.incrementAndGet();
+        invocationCount++;
       }
     }
 

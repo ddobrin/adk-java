@@ -24,7 +24,6 @@ import com.google.adk.events.Event;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Single;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A planner that cycles through sub-agents repeatedly, stopping when an escalate event is detected
@@ -33,8 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class LoopPlanner implements Planner {
 
   private final int maxCycles;
-  private final AtomicInteger cursor = new AtomicInteger(0);
-  private final AtomicInteger cycleCount = new AtomicInteger(0);
+  // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
+  private int cursor;
+  private int cycleCount;
   private ImmutableList<BaseAgent> agents;
 
   public LoopPlanner(int maxCycles) {
@@ -44,14 +44,14 @@ public final class LoopPlanner implements Planner {
   @Override
   public void init(PlanningContext context) {
     agents = context.availableAgents();
-    cursor.set(0);
-    cycleCount.set(0);
+    cursor = 0;
+    cycleCount = 0;
   }
 
   @Override
   public Single<PlannerAction> firstAction(PlanningContext context) {
-    cursor.set(0);
-    cycleCount.set(0);
+    cursor = 0;
+    cycleCount = 0;
     return selectNext(context);
   }
 
@@ -68,13 +68,13 @@ public final class LoopPlanner implements Planner {
       return Single.just(new PlannerAction.Done());
     }
 
-    int idx = cursor.getAndIncrement();
+    int idx = cursor++;
     if (idx >= agents.size()) {
-      int cycle = cycleCount.incrementAndGet();
+      int cycle = ++cycleCount;
       if (cycle >= maxCycles) {
         return Single.just(new PlannerAction.Done());
       }
-      cursor.set(1);
+      cursor = 1;
       idx = 0;
     }
     return Single.just(new PlannerAction.RunAgents(agents.get(idx)));

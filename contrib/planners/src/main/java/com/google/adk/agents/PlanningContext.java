@@ -20,8 +20,8 @@ import com.google.adk.events.Event;
 import com.google.common.collect.ImmutableList;
 import com.google.genai.types.Content;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentMap;
 
 /**
  * Context provided to a {@link Planner} during the planning loop.
@@ -42,7 +42,7 @@ public class PlanningContext {
   }
 
   /** Returns the session state — the shared "world state" that agents read and write. */
-  public ConcurrentMap<String, Object> state() {
+  public Map<String, Object> state() {
     return invocationContext.session().state();
   }
 

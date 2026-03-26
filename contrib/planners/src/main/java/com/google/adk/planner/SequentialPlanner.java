@@ -22,23 +22,23 @@ import com.google.adk.agents.PlannerAction;
 import com.google.adk.agents.PlanningContext;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Single;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /** A planner that runs sub-agents one at a time in order. */
 public final class SequentialPlanner implements Planner {
 
-  private final AtomicInteger cursor = new AtomicInteger(0);
+  // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
+  private int cursor;
   private ImmutableList<BaseAgent> agents;
 
   @Override
   public void init(PlanningContext context) {
     agents = context.availableAgents();
-    cursor.set(0);
+    cursor = 0;
   }
 
   @Override
   public Single<PlannerAction> firstAction(PlanningContext context) {
-    cursor.set(0);
+    cursor = 0;
     return selectNext();
   }
 
@@ -48,10 +48,9 @@ public final class SequentialPlanner implements Planner {
   }
 
   private Single<PlannerAction> selectNext() {
-    int idx = cursor.getAndIncrement();
-    if (agents == null || idx >= agents.size()) {
+    if (agents == null || cursor >= agents.size()) {
       return Single.just(new PlannerAction.Done());
     }
-    return Single.just(new PlannerAction.RunAgents(agents.get(idx)));
+    return Single.just(new PlannerAction.RunAgents(agents.get(cursor++)));
   }
 }
