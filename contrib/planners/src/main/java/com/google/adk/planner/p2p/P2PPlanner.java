@@ -23,9 +23,11 @@ import com.google.adk.agents.PlanningContext;
 import com.google.adk.planner.goap.AgentMetadata;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Single;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.BiPredicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +65,7 @@ public final class P2PPlanner implements Planner {
   private Map<String, AgentActivator> activators;
   // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
   private int invocationCount;
+  private Map<String, Object> outputValueSnapshot;
 
   /**
    * Creates a P2P planner with a custom exit condition.
@@ -92,6 +95,14 @@ public final class P2PPlanner implements Planner {
       activators.put(m.agentName(), new AgentActivator(m));
     }
     invocationCount = 0;
+
+    outputValueSnapshot = new HashMap<>();
+    for (AgentMetadata m : metadata) {
+      Object val = context.state().get(m.outputKey());
+      if (val != null) {
+        outputValueSnapshot.put(m.outputKey(), val);
+      }
+    }
   }
 
   @Override
@@ -114,11 +125,17 @@ public final class P2PPlanner implements Planner {
       activator.finishExecution();
     }
 
-    // Notify all activators about state changes from recently produced keys
+    // Notify activators only about output keys whose values have actually changed
     for (AgentMetadata m : metadata) {
-      if (context.state().containsKey(m.outputKey())) {
-        for (AgentActivator activator : activators.values()) {
-          activator.onStateChanged(m.outputKey());
+      String key = m.outputKey();
+      Object currentValue = context.state().get(key);
+      if (currentValue != null) {
+        Object previousValue = outputValueSnapshot.get(key);
+        if (!Objects.equals(currentValue, previousValue)) {
+          for (AgentActivator activator : activators.values()) {
+            activator.onStateChanged(key);
+          }
+          outputValueSnapshot.put(key, currentValue);
         }
       }
     }

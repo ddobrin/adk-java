@@ -223,6 +223,86 @@ class P2PPlannerTest {
     assertThat(action).isInstanceOf(PlannerAction.Done.class);
   }
 
+  @Test
+  void nextAction_doesNotReactivateWhenOutputUnchanged() {
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    SimpleTestAgent agentB = new SimpleTestAgent("agentB");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of("topic"), "findings"),
+            new AgentMetadata("agentB", ImmutableList.of("topic", "findings"), "hypothesis"));
+
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    state.put("topic", "quantum computing");
+
+    P2PPlanner planner = new P2PPlanner(metadata, 10);
+    PlanningContext context = createPlanningContext(ImmutableList.of(agentA, agentB), state);
+    planner.init(context);
+
+    // First action: only agentA can activate
+    planner.firstAction(context).blockingGet();
+
+    // Simulate agentA producing "findings"
+    context.state().put("findings", "some research findings");
+
+    // Second action: agentB should activate (its inputs are now satisfied)
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) second).agents().get(0).name()).isEqualTo("agentB");
+
+    // Simulate agentB producing "hypothesis"
+    context.state().put("hypothesis", "some hypothesis");
+
+    // Third action: no output values changed, so no agent should re-activate
+    PlannerAction third = planner.nextAction(context).blockingGet();
+    assertThat(third).isInstanceOf(PlannerAction.Done.class);
+  }
+
+  @Test
+  void nextAction_reactivatesWhenOutputValueChanges() {
+    SimpleTestAgent hypothesisAgent = new SimpleTestAgent("hypothesisAgent");
+    SimpleTestAgent criticAgent = new SimpleTestAgent("criticAgent");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata(
+                "hypothesisAgent", ImmutableList.of("topic", "critique"), "hypothesis"),
+            new AgentMetadata("criticAgent", ImmutableList.of("topic", "hypothesis"), "critique"));
+
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    state.put("topic", "quantum computing");
+    state.put("critique", "initial critique");
+
+    P2PPlanner planner = new P2PPlanner(metadata, 10);
+    PlanningContext context =
+        createPlanningContext(ImmutableList.of(hypothesisAgent, criticAgent), state);
+    planner.init(context);
+
+    // First action: hypothesisAgent can activate (topic + critique present)
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) first).agents().get(0).name())
+        .isEqualTo("hypothesisAgent");
+
+    // Simulate hypothesisAgent producing "hypothesis"
+    context.state().put("hypothesis", "hypothesis v1");
+
+    // Second action: criticAgent should activate (hypothesis is new)
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) second).agents().get(0).name()).isEqualTo("criticAgent");
+
+    // Simulate criticAgent OVERWRITING "critique" with a new value
+    context.state().put("critique", "revised critique based on v1");
+
+    // Third action: hypothesisAgent should re-activate because "critique" value CHANGED
+    PlannerAction third = planner.nextAction(context).blockingGet();
+    assertThat(third).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) third).agents().get(0).name())
+        .isEqualTo("hypothesisAgent");
+  }
+
   private static PlanningContext createPlanningContext(
       ImmutableList<BaseAgent> agents, ConcurrentHashMap<String, Object> state) {
     InMemorySessionService sessionService = new InMemorySessionService();

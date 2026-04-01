@@ -22,7 +22,10 @@ import com.google.adk.agents.PlannerAction;
 import com.google.adk.agents.PlanningContext;
 import com.google.common.collect.ImmutableList;
 import io.reactivex.rxjava3.core.Single;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +49,10 @@ import org.slf4j.LoggerFactory;
  *   Resolved groups: [A, B] → [C] → [D]
  *   (A and B are independent and run in parallel)
  * </pre>
+ *
+ * <p>Optionally validates at runtime that each agent group produces its expected output keys in
+ * session state before proceeding to the next group. Enable via the {@code validateOutputs}
+ * constructor parameter.
  */
 public final class GoalOrientedPlanner implements Planner {
 
@@ -53,13 +60,20 @@ public final class GoalOrientedPlanner implements Planner {
 
   private final String goal;
   private final List<AgentMetadata> metadata;
+  private final boolean validateOutputs;
   // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
   private ImmutableList<ImmutableList<BaseAgent>> executionGroups;
+  private Map<String, String> agentNameToOutputKey;
   private int cursor;
 
   public GoalOrientedPlanner(String goal, List<AgentMetadata> metadata) {
+    this(goal, metadata, false);
+  }
+
+  public GoalOrientedPlanner(String goal, List<AgentMetadata> metadata, boolean validateOutputs) {
     this.goal = goal;
     this.metadata = metadata;
+    this.validateOutputs = validateOutputs;
   }
 
   @Override
@@ -77,6 +91,11 @@ public final class GoalOrientedPlanner implements Planner {
                     group.stream().map(context::findAgent).collect(ImmutableList.toImmutableList()))
             .collect(ImmutableList.toImmutableList());
     cursor = 0;
+
+    agentNameToOutputKey = new HashMap<>();
+    for (AgentMetadata m : metadata) {
+      agentNameToOutputKey.put(m.agentName(), m.outputKey());
+    }
   }
 
   @Override
@@ -87,6 +106,29 @@ public final class GoalOrientedPlanner implements Planner {
 
   @Override
   public Single<PlannerAction> nextAction(PlanningContext context) {
+    if (validateOutputs && cursor > 0 && executionGroups != null) {
+      ImmutableList<BaseAgent> previousGroup = executionGroups.get(cursor - 1);
+      List<String> missingOutputs = new ArrayList<>();
+
+      for (BaseAgent agent : previousGroup) {
+        String expectedOutput = agentNameToOutputKey.get(agent.name());
+        if (expectedOutput != null && !context.state().containsKey(expectedOutput)) {
+          missingOutputs.add(agent.name() + " -> " + expectedOutput);
+          logger.warn(
+              "GoalOrientedPlanner: agent '{}' did not produce expected output key '{}'",
+              agent.name(),
+              expectedOutput);
+        }
+      }
+
+      if (!missingOutputs.isEmpty()) {
+        String message =
+            "Execution stopped: missing expected outputs from previous group: "
+                + String.join(", ", missingOutputs);
+        logger.warn(message);
+        return Single.just(new PlannerAction.DoneWithResult(message));
+      }
+    }
     return selectNext();
   }
 

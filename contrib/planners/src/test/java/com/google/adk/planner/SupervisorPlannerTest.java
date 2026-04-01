@@ -20,6 +20,8 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.adk.agents.BaseAgent;
@@ -28,6 +30,7 @@ import com.google.adk.agents.PlannerAction;
 import com.google.adk.agents.PlanningContext;
 import com.google.adk.events.Event;
 import com.google.adk.models.BaseLlm;
+import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.sessions.InMemorySessionService;
 import com.google.adk.sessions.Session;
@@ -37,6 +40,7 @@ import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 /** Unit tests for {@link SupervisorPlanner}. */
 class SupervisorPlannerTest {
@@ -141,6 +145,66 @@ class SupervisorPlannerTest {
 
     PlannerAction action = planner.firstAction(context).blockingGet();
     assertThat(action).isInstanceOf(PlannerAction.Done.class);
+  }
+
+  @Test
+  void buildPrompt_includesDecisionHistory() {
+    BaseLlm mockLlm = mock(BaseLlm.class);
+
+    LlmResponse response1 = createTextResponse("agentA");
+    LlmResponse response2 = createTextResponse("DONE");
+    when(mockLlm.generateContent(any(), eq(false)))
+        .thenReturn(Flowable.just(response1))
+        .thenReturn(Flowable.just(response2));
+
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+
+    SupervisorPlanner planner = new SupervisorPlanner(mockLlm, "You are a supervisor.", 2);
+    PlanningContext context =
+        createPlanningContext(ImmutableList.of(agentA), new ConcurrentHashMap<>());
+
+    planner.firstAction(context).blockingGet();
+    planner.nextAction(context).blockingGet();
+
+    ArgumentCaptor<LlmRequest> requestCaptor = ArgumentCaptor.forClass(LlmRequest.class);
+    verify(mockLlm, times(2)).generateContent(requestCaptor.capture(), eq(false));
+
+    LlmRequest secondRequest = requestCaptor.getAllValues().get(1);
+    String promptText = secondRequest.contents().get(0).parts().get().get(0).text().get();
+    assertThat(promptText).contains("Previous decisions");
+    assertThat(promptText).contains("Run: agentA");
+  }
+
+  @Test
+  void decisionHistory_accumulatesAcrossCalls() {
+    BaseLlm mockLlm = mock(BaseLlm.class);
+
+    LlmResponse response1 = createTextResponse("agentA");
+    LlmResponse response2 = createTextResponse("agentB");
+    LlmResponse response3 = createTextResponse("DONE");
+    when(mockLlm.generateContent(any(), eq(false)))
+        .thenReturn(Flowable.just(response1))
+        .thenReturn(Flowable.just(response2))
+        .thenReturn(Flowable.just(response3));
+
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    SimpleTestAgent agentB = new SimpleTestAgent("agentB");
+
+    SupervisorPlanner planner = new SupervisorPlanner(mockLlm, "You are a supervisor.");
+    PlanningContext context =
+        createPlanningContext(ImmutableList.of(agentA, agentB), new ConcurrentHashMap<>());
+
+    planner.firstAction(context).blockingGet();
+    planner.nextAction(context).blockingGet();
+    planner.nextAction(context).blockingGet();
+
+    ArgumentCaptor<LlmRequest> requestCaptor = ArgumentCaptor.forClass(LlmRequest.class);
+    verify(mockLlm, times(3)).generateContent(requestCaptor.capture(), eq(false));
+
+    LlmRequest thirdRequest = requestCaptor.getAllValues().get(2);
+    String promptText = thirdRequest.contents().get(0).parts().get().get(0).text().get();
+    assertThat(promptText).contains("1. Run: agentA");
+    assertThat(promptText).contains("2. Run: agentB");
   }
 
   private static LlmResponse createTextResponse(String text) {

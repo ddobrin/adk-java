@@ -305,6 +305,124 @@ class GoalOrientedPlannerTest {
     assertThat(fourth).isInstanceOf(PlannerAction.Done.class);
   }
 
+  @Test
+  void goalOrientedPlanner_validationEnabled_outputPresent_proceeds() {
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    SimpleTestAgent agentB = new SimpleTestAgent("agentB");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of(), "outputA"),
+            new AgentMetadata("agentB", ImmutableList.of("outputA"), "outputB"));
+
+    GoalOrientedPlanner planner = new GoalOrientedPlanner("outputB", metadata, true);
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    PlanningContext context = createPlanningContext(ImmutableList.of(agentA, agentB), state);
+    planner.init(context);
+
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+
+    // Simulate agentA producing its output
+    context.state().put("outputA", "some value");
+
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) second).agents().get(0).name()).isEqualTo("agentB");
+  }
+
+  @Test
+  void goalOrientedPlanner_validationEnabled_outputMissing_stops() {
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    SimpleTestAgent agentB = new SimpleTestAgent("agentB");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of(), "outputA"),
+            new AgentMetadata("agentB", ImmutableList.of("outputA"), "outputB"));
+
+    GoalOrientedPlanner planner = new GoalOrientedPlanner("outputB", metadata, true);
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    PlanningContext context = createPlanningContext(ImmutableList.of(agentA, agentB), state);
+    planner.init(context);
+
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+
+    // Do NOT put "outputA" into state — simulating agent failure
+
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.DoneWithResult.class);
+    PlannerAction.DoneWithResult result = (PlannerAction.DoneWithResult) second;
+    assertThat(result.result()).contains("agentA");
+    assertThat(result.result()).contains("outputA");
+  }
+
+  @Test
+  void goalOrientedPlanner_validationDisabled_outputMissing_proceeds() {
+    SimpleTestAgent agentA = new SimpleTestAgent("agentA");
+    SimpleTestAgent agentB = new SimpleTestAgent("agentB");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("agentA", ImmutableList.of(), "outputA"),
+            new AgentMetadata("agentB", ImmutableList.of("outputA"), "outputB"));
+
+    // Default constructor — validateOutputs defaults to false
+    GoalOrientedPlanner planner = new GoalOrientedPlanner("outputB", metadata);
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    PlanningContext context = createPlanningContext(ImmutableList.of(agentA, agentB), state);
+    planner.init(context);
+
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+
+    // Do NOT put "outputA" into state
+
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) second).agents().get(0).name()).isEqualTo("agentB");
+  }
+
+  @Test
+  void goalOrientedPlanner_validationEnabled_parallelGroupPartialFailure() {
+    SimpleTestAgent personExtractor = new SimpleTestAgent("personExtractor");
+    SimpleTestAgent signExtractor = new SimpleTestAgent("signExtractor");
+    SimpleTestAgent horoscopeGenerator = new SimpleTestAgent("horoscopeGenerator");
+
+    List<AgentMetadata> metadata =
+        List.of(
+            new AgentMetadata("personExtractor", ImmutableList.of("prompt"), "person"),
+            new AgentMetadata("signExtractor", ImmutableList.of("prompt"), "sign"),
+            new AgentMetadata(
+                "horoscopeGenerator", ImmutableList.of("person", "sign"), "horoscope"));
+
+    GoalOrientedPlanner planner = new GoalOrientedPlanner("horoscope", metadata, true);
+    ConcurrentHashMap<String, Object> state = new ConcurrentHashMap<>();
+    state.put("prompt", "My name is Mario and my zodiac sign is pisces");
+
+    PlanningContext context =
+        createPlanningContext(
+            ImmutableList.of(personExtractor, signExtractor, horoscopeGenerator), state);
+    planner.init(context);
+
+    // First action: [personExtractor, signExtractor] in parallel
+    PlannerAction first = planner.firstAction(context).blockingGet();
+    assertThat(first).isInstanceOf(PlannerAction.RunAgents.class);
+    assertThat(((PlannerAction.RunAgents) first).agents()).hasSize(2);
+
+    // Simulate: personExtractor succeeds, signExtractor fails
+    context.state().put("person", "Mario");
+    // "sign" is NOT produced
+
+    PlannerAction second = planner.nextAction(context).blockingGet();
+    assertThat(second).isInstanceOf(PlannerAction.DoneWithResult.class);
+    PlannerAction.DoneWithResult result = (PlannerAction.DoneWithResult) second;
+    assertThat(result.result()).contains("signExtractor");
+    assertThat(result.result()).contains("sign");
+    assertThat(result.result()).doesNotContain("personExtractor");
+  }
+
   private static PlanningContext createPlanningContext(
       ImmutableList<BaseAgent> agents, ConcurrentHashMap<String, Object> state) {
     // Create a minimal InvocationContext for testing

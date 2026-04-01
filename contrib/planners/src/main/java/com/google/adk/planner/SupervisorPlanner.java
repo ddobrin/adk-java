@@ -29,6 +29,7 @@ import com.google.genai.types.Content;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Single;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -46,16 +47,25 @@ public final class SupervisorPlanner implements Planner {
 
   private static final Logger logger = LoggerFactory.getLogger(SupervisorPlanner.class);
 
+  private static final int DEFAULT_MAX_EVENTS = 20;
+
   private final BaseLlm llm;
   private final Optional<String> systemInstruction;
+  private final int maxEvents;
+  private final List<String> decisionHistory = new ArrayList<>();
 
-  public SupervisorPlanner(BaseLlm llm, String systemInstruction) {
+  public SupervisorPlanner(BaseLlm llm, String systemInstruction, int maxEvents) {
     this.llm = llm;
     this.systemInstruction = Optional.ofNullable(systemInstruction);
+    this.maxEvents = maxEvents;
+  }
+
+  public SupervisorPlanner(BaseLlm llm, String systemInstruction) {
+    this(llm, systemInstruction, DEFAULT_MAX_EVENTS);
   }
 
   public SupervisorPlanner(BaseLlm llm) {
-    this(llm, null);
+    this(llm, null, DEFAULT_MAX_EVENTS);
   }
 
   @Override
@@ -88,7 +98,9 @@ public final class SupervisorPlanner implements Planner {
         .map(
             response -> {
               String text = extractText(response);
-              return parseResponse(text, context);
+              PlannerAction action = parseResponse(text, context);
+              recordDecision(action);
+              return action;
             })
         .onErrorReturn(
             error -> {
@@ -109,7 +121,7 @@ public final class SupervisorPlanner implements Planner {
     List<Event> events = context.events();
     if (!events.isEmpty()) {
       sb.append("\nRecent events:\n");
-      int start = Math.max(0, events.size() - 5);
+      int start = Math.max(0, events.size() - maxEvents);
       for (int i = start; i < events.size(); i++) {
         Event event = events.get(i);
         sb.append("- ")
@@ -117,6 +129,13 @@ public final class SupervisorPlanner implements Planner {
             .append(": ")
             .append(event.stringifyContent())
             .append("\n");
+      }
+    }
+
+    if (!decisionHistory.isEmpty()) {
+      sb.append("\nPrevious decisions (in order):\n");
+      for (int i = 0; i < decisionHistory.size(); i++) {
+        sb.append(i + 1).append(". ").append(decisionHistory.get(i)).append("\n");
       }
     }
 
@@ -174,5 +193,16 @@ public final class SupervisorPlanner implements Planner {
       return new PlannerAction.Done();
     }
     return new PlannerAction.RunAgents(agents);
+  }
+
+  private void recordDecision(PlannerAction action) {
+    if (action instanceof PlannerAction.RunAgents run) {
+      decisionHistory.add(
+          "Run: " + run.agents().stream().map(BaseAgent::name).collect(Collectors.joining(", ")));
+    } else if (action instanceof PlannerAction.DoneWithResult done) {
+      decisionHistory.add("Done: " + done.result());
+    } else if (action instanceof PlannerAction.Done) {
+      decisionHistory.add("Done");
+    }
   }
 }
