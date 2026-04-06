@@ -50,9 +50,16 @@ import org.slf4j.LoggerFactory;
  *   (A and B are independent and run in parallel)
  * </pre>
  *
- * <p>Optionally validates at runtime that each agent group produces its expected output keys in
- * session state before proceeding to the next group. Enable via the {@code validateOutputs}
- * constructor parameter.
+ * <p>Supports configurable failure handling via {@link ReplanPolicy}:
+ *
+ * <ul>
+ *   <li>{@link ReplanPolicy.Ignore} — proceed regardless of missing outputs (default)
+ *   <li>{@link ReplanPolicy.FailStop} — halt on first missing output
+ *   <li>{@link ReplanPolicy.Replan} — recompute the remaining plan from current world state
+ * </ul>
+ *
+ * <p>Supports pluggable search strategies via {@link SearchStrategy}: backward-chaining DFS ({@link
+ * DfsSearchStrategy}) or forward A* ({@link AStarSearchStrategy}).
  */
 public final class GoalOrientedPlanner implements Planner {
 
@@ -60,27 +67,107 @@ public final class GoalOrientedPlanner implements Planner {
 
   private final String goal;
   private final List<AgentMetadata> metadata;
-  private final boolean validateOutputs;
+  private final SearchStrategy searchStrategy;
+  private final ReplanPolicy replanPolicy;
   // Mutable state — planners are used within a single reactive pipeline and are not thread-safe.
   private ImmutableList<ImmutableList<BaseAgent>> executionGroups;
   private Map<String, String> agentNameToOutputKey;
   private int cursor;
+  private int replanCount;
 
   public GoalOrientedPlanner(String goal, List<AgentMetadata> metadata) {
-    this(goal, metadata, false);
+    this(goal, metadata, new DfsSearchStrategy(), new ReplanPolicy.Ignore());
   }
 
   public GoalOrientedPlanner(String goal, List<AgentMetadata> metadata, boolean validateOutputs) {
+    this(
+        goal,
+        metadata,
+        new DfsSearchStrategy(),
+        validateOutputs ? new ReplanPolicy.FailStop() : new ReplanPolicy.Ignore());
+  }
+
+  public GoalOrientedPlanner(
+      String goal,
+      List<AgentMetadata> metadata,
+      SearchStrategy searchStrategy,
+      ReplanPolicy replanPolicy) {
     this.goal = goal;
     this.metadata = metadata;
-    this.validateOutputs = validateOutputs;
+    this.searchStrategy = searchStrategy;
+    this.replanPolicy = replanPolicy;
   }
 
   @Override
   public void init(PlanningContext context) {
+    buildPlan(context);
+    replanCount = 0;
+  }
+
+  @Override
+  public Single<PlannerAction> firstAction(PlanningContext context) {
+    cursor = 0;
+    return selectNext();
+  }
+
+  @Override
+  public Single<PlannerAction> nextAction(PlanningContext context) {
+    if (cursor > 0 && executionGroups != null) {
+      List<String> missingOutputs = findMissingOutputs(executionGroups.get(cursor - 1), context);
+
+      if (!missingOutputs.isEmpty()) {
+        if (replanPolicy instanceof ReplanPolicy.FailStop) {
+          String message =
+              "Execution stopped: missing expected outputs from previous group: "
+                  + String.join(", ", missingOutputs);
+          logger.warn(message);
+          return Single.just(new PlannerAction.DoneWithResult(message));
+        } else if (replanPolicy instanceof ReplanPolicy.Replan replan) {
+          if (replanCount >= replan.maxAttempts()) {
+            String message =
+                "Execution stopped: max replan attempts ("
+                    + replan.maxAttempts()
+                    + ") exhausted. Still missing: "
+                    + String.join(", ", missingOutputs);
+            logger.warn(message);
+            return Single.just(new PlannerAction.DoneWithResult(message));
+          }
+
+          replanCount++;
+          logger.info(
+              "Replanning (attempt {}/{}). Current state keys: {}. Missing outputs: {}",
+              replanCount,
+              replan.maxAttempts(),
+              context.state().keySet(),
+              missingOutputs);
+
+          try {
+            buildPlan(context);
+          } catch (IllegalStateException e) {
+            String message = "Replanning failed: " + e.getMessage();
+            logger.warn(message);
+            return Single.just(new PlannerAction.DoneWithResult(message));
+          }
+
+          if (executionGroups.isEmpty()) {
+            return Single.just(new PlannerAction.Done());
+          }
+
+          logger.info("Replanned execution groups: {}", executionGroupNames());
+        }
+        // ReplanPolicy.Ignore: proceed with current plan
+      } else {
+        // Previous group succeeded — reset consecutive replan counter
+        replanCount = 0;
+      }
+    }
+    return selectNext();
+  }
+
+  private void buildPlan(PlanningContext context) {
     GoalOrientedSearchGraph graph = new GoalOrientedSearchGraph(metadata);
     ImmutableList<ImmutableList<String>> agentGroups =
-        DependencyGraphSearch.searchGrouped(graph, metadata, context.state().keySet(), goal);
+        searchStrategy.searchGrouped(graph, metadata, context.state().keySet(), goal);
 
     logger.info("GoalOrientedPlanner resolved execution groups: {}", agentGroups);
 
@@ -98,38 +185,25 @@ public final class GoalOrientedPlanner implements Planner {
     }
   }
 
-  @Override
-  public Single<PlannerAction> firstAction(PlanningContext context) {
-    cursor = 0;
-    return selectNext();
-  }
-
-  @Override
-  public Single<PlannerAction> nextAction(PlanningContext context) {
-    if (validateOutputs && cursor > 0 && executionGroups != null) {
-      ImmutableList<BaseAgent> previousGroup = executionGroups.get(cursor - 1);
-      List<String> missingOutputs = new ArrayList<>();
-
-      for (BaseAgent agent : previousGroup) {
-        String expectedOutput = agentNameToOutputKey.get(agent.name());
-        if (expectedOutput != null && !context.state().containsKey(expectedOutput)) {
-          missingOutputs.add(agent.name() + " -> " + expectedOutput);
-          logger.warn(
-              "GoalOrientedPlanner: agent '{}' did not produce expected output key '{}'",
-              agent.name(),
-              expectedOutput);
-        }
-      }
-
-      if (!missingOutputs.isEmpty()) {
-        String message =
-            "Execution stopped: missing expected outputs from previous group: "
-                + String.join(", ", missingOutputs);
-        logger.warn(message);
-        return Single.just(new PlannerAction.DoneWithResult(message));
+  private List<String> findMissingOutputs(ImmutableList<BaseAgent> group, PlanningContext context) {
+    List<String> missing = new ArrayList<>();
+    for (BaseAgent agent : group) {
+      String expectedOutput = agentNameToOutputKey.get(agent.name());
+      if (expectedOutput != null && !context.state().containsKey(expectedOutput)) {
+        missing.add(agent.name() + " -> " + expectedOutput);
+        logger.warn(
+            "GoalOrientedPlanner: agent '{}' did not produce expected output key '{}'",
+            agent.name(),
+            expectedOutput);
       }
     }
-    return selectNext();
+    return missing;
+  }
+
+  private List<List<String>> executionGroupNames() {
+    return executionGroups.stream()
+        .map(group -> group.stream().map(BaseAgent::name).toList())
+        .toList();
   }
 
   private Single<PlannerAction> selectNext() {

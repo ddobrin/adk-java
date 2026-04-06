@@ -81,6 +81,27 @@ public final class DependencyGraphSearch {
       String goal) {
 
     ImmutableList<String> flatOrder = search(graph, preconditions, goal);
+    return assignParallelLevels(flatOrder, metadata, preconditions, graph);
+  }
+
+  /**
+   * Assigns agents from a flat execution order into parallelizable groups based on dependency
+   * depth.
+   *
+   * <p>Each agent's level is {@code 1 + max(level of its dependency agents)}. Agents at the same
+   * level have no mutual dependencies and can run in parallel.
+   *
+   * @param flatOrder ordered list of agent names (topological order)
+   * @param metadata agent metadata for dependency lookup
+   * @param preconditions state keys already available
+   * @param graph the dependency graph
+   * @return ordered list of agent groups for parallel execution
+   */
+  static ImmutableList<ImmutableList<String>> assignParallelLevels(
+      ImmutableList<String> flatOrder,
+      List<AgentMetadata> metadata,
+      Collection<String> preconditions,
+      GoalOrientedSearchGraph graph) {
 
     if (flatOrder.isEmpty()) {
       return ImmutableList.of();
