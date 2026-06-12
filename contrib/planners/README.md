@@ -1,6 +1,6 @@
 # ADK Planners (`google-adk-planners`)
 
-Pluggable planner implementations for the ADK `PlannerAgent`. This module provides six planning strategies for dynamically orchestrating sub-agent execution at runtime — from simple sequential dispatch to sophisticated goal-oriented planning with adaptive replanning.
+Pluggable planner implementations for the ADK `PlannerAgent`. This module provides seven planning strategies for dynamically orchestrating sub-agent execution at runtime — from simple sequential dispatch to sophisticated goal-oriented planning and LLM-authored plan-and-execute DAGs with adaptive replanning.
 
 ## Table of Contents
 
@@ -9,11 +9,12 @@ Pluggable planner implementations for the ADK `PlannerAgent`. This module provid
 3. [Simple Planners](#3-simple-planners)
 4. [Goal-Oriented Action Planning (GOAP)](#4-goal-oriented-action-planning-goap)
 5. [Peer-to-Peer (P2P) Planner](#5-peer-to-peer-p2p-planner)
-6. [Choosing a Planner](#6-choosing-a-planner)
-7. [Advanced Topics](#7-advanced-topics)
-8. [Testing](#8-testing)
-9. [Package Reference](#9-package-reference)
-10. [License](#10-license)
+6. [Plan-and-Execute / LLMCompiler](#6-plan-and-execute--llmcompiler)
+7. [Choosing a Planner](#7-choosing-a-planner)
+8. [Advanced Topics](#8-advanced-topics)
+9. [Testing](#9-testing)
+10. [Package Reference](#10-package-reference)
+11. [License](#11-license)
 
 ---
 
@@ -52,6 +53,7 @@ The `PlannerAgent` delegates execution decisions to a `Planner` strategy. Swap t
 | `SupervisorPlanner` | `planner` | LLM selects next agent(s) | Yes | Open-ended task delegation |
 | `GoalOrientedPlanner` | `planner.goap` | Dependency-resolved groups | No | Workflows with input/output contracts |
 | `P2PPlanner` | `planner.p2p` | Reactive dynamic activation | No | Collaborative refinement loops |
+| `LlmCompilerPlanner` | `planner.llmcompiler` | LLM-authored DAG, leveled groups | Yes | Open-ended goals with semantic replanning |
 
 ---
 
@@ -577,7 +579,166 @@ Only **actual value changes** trigger re-activation. If an agent produces the sa
 
 ---
 
-## 6. Choosing a Planner
+## 6. Plan-and-Execute / LLMCompiler
+
+The LLMCompiler planner (`com.google.adk.planner.llmcompiler`) realizes the **Plan-and-Execute** orchestration shape: a planning LLM authors an **entire task DAG in one shot**, a deterministic engine levels it into parallel execution groups, and a pluggable **Joiner** inspects the results to decide whether the work is done or another plan should run.
+
+It is the LLM-authored counterpart to GOAP. Both produce leveled, parallel execution groups from the same `AgentMetadata` catalog — but where GOAP *derives* the graph from declared input/output contracts, the LLMCompiler lets the model *author* the graph (with explicit `dependsOn` edges), then validates it against those same contracts.
+
+### One-Shot DAG Authoring vs Derived Graph
+
+```
+GOAP                                  LLMCompiler
+────                                  ───────────
+AgentMetadata (inputKeys/outputKey)   AgentMetadata (rendered as a catalog)
+        │                                     │
+        v                                     v
+graph DERIVED from I/O contracts       LLM AUTHORS a DAG (explicit dependsOn)
+        │                                     │
+        │                              PlanValidator (checks against contracts)
+        │                                     │
+        v                                     v
+   leveled groups  ◄───── same shape ─────►  leveled groups (DagLeveler)
+```
+
+The model receives the catalog rendered as `"- <name>: Requires <inputKeys>. Produces <outputKey>."` and must emit strict JSON: a list of tasks, each with an `id`, an `agent`, and a `dependsOn` list of other task ids.
+
+```json
+{
+  "label": "Research fan-out",
+  "tasks": [
+    {"id": 1, "agent": "gather",     "dependsOn": []},
+    {"id": 2, "agent": "summarizeA", "dependsOn": [1]},
+    {"id": 3, "agent": "summarizeB", "dependsOn": [1]},
+    {"id": 4, "agent": "synthesize", "dependsOn": [2, 3]}
+  ]
+}
+```
+
+### From `dependsOn` to Parallel Levels
+
+`DagLeveler` assigns each task a level over the explicit edges (`level = 0` for no dependencies, else `1 + max(dependency levels)`), then groups **agent names** by level, preserving authored order. Tasks at the same level have no mutual dependency and run in parallel:
+
+```
+Level 0: [gather]                    ← runs first
+Level 1: [summarizeA, summarizeB]    ← run in parallel after gather
+Level 2: [synthesize]                ← waits for both summaries
+```
+
+Each level surfaces to the `PlannerAgent` loop as one `RunAgents` action (multiple agents in a level → executed in parallel).
+
+### The Joiner: Semantic Finish-vs-Replan
+
+Once a plan's groups are exhausted, the planner consults a **`Joiner`** instead of stopping. This is the heart of the pattern — adaptive, **results-driven** replanning:
+
+```java
+public interface Joiner {
+    Single<JoinDecision> decide(PlanningContext context, int replanCount);
+}
+
+public sealed interface JoinDecision permits Finish, Replan {
+    record Finish(String result) implements JoinDecision {}   // done — here is the deliverable
+    record Replan(String feedback) implements JoinDecision {}  // not good enough — try again with this guidance
+}
+```
+
+A `Finish` ends the run with its result. A `Replan` recompiles the plan, **carrying the joiner's feedback into the next planning prompt** (a `REPLAN FEEDBACK` block), bounded by `maxReplans` (default 2). The `replanCount` is threaded into every `decide(...)` call so the joiner can escalate or give up.
+
+Two implementations ship:
+
+| Joiner | Decides via | Use when |
+|--------|-------------|----------|
+| `LlmJoiner` | An LLM call over the state + recent events; parses `FINISH: <summary>` / `REPLAN: <feedback>` | "Good enough" is a judgment call best made by a model |
+| `PredicateJoiner` | A pure `Predicate<Map<String,Object>>` over session state — no LLM | Completion is directly checkable (a key is present, a score clears a threshold, a count is reached) |
+
+```java
+// Deterministic: finish once "synthesis" exists, else ask for another pass.
+Joiner joiner = new PredicateJoiner(
+    state -> state.containsKey("synthesis"),
+    state -> (String) state.get("synthesis"),
+    state -> "No synthesis produced yet — add a synthesis step.");
+```
+
+`LlmJoiner` is fail-safe: if its LLM call errors, it returns `Finish` (never an infinite replan loop). `PredicateJoiner` is fully deterministic — the same state always yields the same decision.
+
+### Semantic vs Structural Replanning
+
+This is the key distinction from GOAP's `ReplanPolicy`:
+
+- **GOAP replans on *structural* failure** — an agent ran but its declared `outputKey` is missing from state. The plan is structurally incomplete.
+- **LLMCompiler replans on *semantic* judgment** — the outputs all exist, but the Joiner decides they are not yet good enough (shallow research, an unverified claim, a low quality score). The plan ran fine; the *result* needs another pass.
+
+The two are complementary: structural replanning fixes *broken* plans, semantic replanning improves *complete-but-insufficient* ones.
+
+### Robustness: Self-Repair, then GOAP Fallback
+
+An LLM authoring strict JSON against a contract can get it wrong. `LlmPlanCompiler` makes a bad plan non-fatal with a two-tier safety net:
+
+```
+compile(instruction, feedback, state)
+        │
+        v
+  callLlm → parse → PlanValidator.validate
+        │
+   ┌────┴─────┐
+  valid     invalid
+   │           │
+   │     self-repair: re-prompt ONCE with the validation
+   │     errors injected as a VALIDATION ERRORS block
+   │           │
+   │      ┌────┴─────┐
+   │     valid    still invalid / malformed JSON / LLM error
+   │      │           │
+   v      v           v
+  use the LLM plan   GOAP fallback: DependencyGraphSearch.searchGrouped(...)
+  (fromLlm = true)   toward fallbackGoal (fromLlm = false)
+```
+
+`PlanValidator` checks: non-empty plan, unique task ids, known agents (in the catalog), `dependsOn` edges that point at real tasks, acyclicity, and **precondition closure** — for every task, `initialState ∪ {outputKey of every transitive dependency}` must supply each of that task's `inputKeys`. If both LLM attempts fail, the deterministic GOAP search produces a valid plan toward `fallbackGoal`; if even that is unresolvable, an empty plan surfaces as a `DoneWithResult`. **A run never hard-fails on a bad plan.**
+
+### Usage
+
+```java
+List<AgentMetadata> catalog = List.of(
+    new AgentMetadata("gather",     ImmutableList.of("topic"),        "raw"),
+    new AgentMetadata("summarizeA", ImmutableList.of("raw"),          "sumA"),
+    new AgentMetadata("summarizeB", ImmutableList.of("raw"),          "sumB"),
+    new AgentMetadata("synthesize", ImmutableList.of("sumA", "sumB"), "report"));
+
+LlmCompilerPlanner planner =
+    LlmCompilerPlanner.builder(planningLlm, catalog)
+        .fallbackGoal("report")                 // GOAP fallback target
+        .joiner(new LlmJoiner(joinerLlm, "produce a well-sourced report"))
+        .maxReplans(2)                          // semantic replanning ceiling
+        .defaultInstruction("Research the topic and produce a report.")
+        .build();
+
+PlannerAgent agent = PlannerAgent.builder()
+    .name("research")
+    .subAgents(gatherAgent, summarizeAAgent, summarizeBAgent, synthesizeAgent)
+    .planner(planner)
+    .build();
+```
+
+Builder defaults: the **default joiner finishes after one plan** (no replanning), `maxReplans` is `2`, and the GOAP fallback uses `DfsSearchStrategy`. Supply a `joiner(...)` to enable adaptive replanning. For full control over the compiler (custom fallback strategy or a test double), use `LlmCompilerPlanner.builder(LlmPlanCompiler)`.
+
+### GOAP vs LLMCompiler
+
+| Dimension | GOAP | LLMCompiler |
+|-----------|------|-------------|
+| **Who builds the graph** | Engine derives it from I/O contracts | LLM authors it (explicit `dependsOn`) |
+| **Plan computation** | Deterministic search at `init` | LLM call in `firstAction` (validated) |
+| **LLM required** | No | Yes (planning LLM; joiner LLM optional) |
+| **Edges** | Implied by `inputKeys`/`outputKey` | Explicit in the authored DAG |
+| **Validation** | Graph build (duplicate/unresolvable keys throw) | `PlanValidator` against the same contracts |
+| **Replanning trigger** | *Structural* — a declared output is missing | *Semantic* — the Joiner judges the result insufficient |
+| **Bad-plan handling** | `ReplanPolicy` (Ignore/FailStop/Replan) | Self-repair → GOAP fallback (never hard-fails) |
+| **Parallelism** | Agents grouped by dependency level | Agents grouped by `dependsOn` level (`DagLeveler`) |
+| **Best for** | Known dependency DAGs, fully deterministic | Open-ended goals where plan shape and "done" are judgment calls |
+
+---
+
+## 7. Choosing a Planner
 
 ### Decision Flowchart
 
@@ -630,6 +791,8 @@ Only **actual value changes** trigger re-activation. If an agent produces the sa
                                                                                 └────────────┘
 ```
 
+> **Two LLM-driven planners — which one?** Both `SupervisorPlanner` and `LlmCompilerPlanner` use an LLM, but at different granularities. `SupervisorPlanner` decides **one step at a time** (it re-prompts after every agent runs) — best when the path is genuinely unknown and each choice depends on the last result. `LlmCompilerPlanner` authors the **whole DAG up front** (one planning call, then deterministic parallel execution) and only re-engages the LLM via the Joiner to judge finish-vs-replan — best when the work decomposes into a plannable graph and you want maximal parallelism with a semantic "good enough" gate.
+
 ### Use Case Catalog
 
 | Scenario | Recommended Planner | Why |
@@ -640,6 +803,7 @@ Only **actual value changes** trigger re-activation. If an agent produces the sa
 | Open-ended task delegation | `SupervisorPlanner` | LLM decides what to do based on context |
 | Multi-step workflow with dependencies | `GoalOrientedPlanner` | Agents declare I/O; planner resolves order automatically |
 | Research collaboration with critic feedback | `P2PPlanner` | Agents re-execute as inputs refine |
+| Open-ended goal where the LLM should plan the whole DAG, then judge "done" | `LlmCompilerPlanner` | One-shot plan authoring + parallel levels + semantic replanning via a Joiner |
 
 ### Composability
 
@@ -669,7 +833,7 @@ PlannerAgent pipeline = PlannerAgent.builder()
 
 ---
 
-## 7. Advanced Topics
+## 8. Advanced Topics
 
 ### Implementing a Custom Planner
 
@@ -762,7 +926,7 @@ PlannerAgent agent = PlannerAgent.builder()
 
 ---
 
-## 8. Testing
+## 9. Testing
 
 ### Test Stack
 
@@ -791,9 +955,18 @@ src/test/java/com/google/adk/
     │   ├── GoalOrientedPlannerTest.java     # GOAP planning + dependency resolution
     │   ├── ReplanningTest.java              # Replan policy behavior
     │   └── CouncilTopologyTest.java         # 9-agent DAG (GOAP behavior)
-    └── p2p/
-        ├── P2PPlannerTest.java              # Reactive activation + refinement
-        └── P2PCouncilTopologyTest.java      # 9-agent DAG (P2P behavior)
+    ├── p2p/
+    │   ├── P2PPlannerTest.java              # Reactive activation + refinement
+    │   └── P2PCouncilTopologyTest.java      # 9-agent DAG (P2P behavior)
+    └── llmcompiler/
+        ├── PlanValidatorTest.java           # Plan validation rules
+        ├── DagLevelerTest.java              # dependsOn → parallel levels
+        ├── LlmPlanCompilerTest.java         # compile + self-repair + GOAP fallback
+        ├── LlmCompilerPlannerTest.java      # loop mechanics (group walk, parallelism, skips)
+        ├── AdaptiveReplanningTest.java      # Joiner-driven finish-vs-replan + bounding
+        ├── LlmJoinerTest.java               # FINISH/REPLAN parsing + fail-safe
+        ├── PredicateJoinerTest.java         # deterministic finish-vs-replan
+        └── LlmCompilerTopologyTest.java     # 8-task DAG end-to-end (LLM-authored)
 ```
 
 Larger test suites use `@Nested` classes to group related scenarios. For example, `CouncilTopologyTest` organizes into:
@@ -858,6 +1031,14 @@ assertThat(astarGroups).isEqualTo(dfsGroups);
 | `CouncilTopologyTest` | Complex GOAP | 9-agent DAG, partial failure, cross-strategy equivalence |
 | `P2PPlannerTest` | Reactive activation | Value-change detection, exit conditions, maxInvocations |
 | `P2PCouncilTopologyTest` | Complex P2P | Wave activation, iterative refinement, termination |
+| `PlanValidatorTest` | Plan validation | Empty/duplicate-id/unknown-agent/dangling-edge/cycle/precondition-closure |
+| `DagLevelerTest` | Leveling | Linear chain, diamond, 8-task council DAG → level groups |
+| `LlmPlanCompilerTest` | Compile pipeline | Self-repair retry, GOAP fallback, malformed JSON, `extractJson` |
+| `LlmCompilerPlannerTest` | Loop mechanics | First group, full walk, parallel level, unknown-agent skip |
+| `AdaptiveReplanningTest` | Semantic replanning | Finish immediately, replan-then-finish (feedback carried), `maxReplans` bound |
+| `LlmJoinerTest` | Joiner parsing | `FINISH:`/`REPLAN:` parsing, unlabeled→finish, LLM-error fail-safe |
+| `PredicateJoinerTest` | Deterministic joiner | Complete→Finish (interpolated), incomplete→Replan (feedback) |
+| `LlmCompilerTopologyTest` | Complex LLMCompiler | 8-task LLM-authored DAG, 3 leveled groups in order |
 
 ### Running Tests
 
@@ -867,7 +1048,7 @@ mvn test -pl contrib/planners
 
 ---
 
-## 9. Package Reference
+## 10. Package Reference
 
 ### Source Layout
 
@@ -892,9 +1073,20 @@ contrib/planners/src/main/java/com/google/adk/
     │   ├── DependencyGraphSearch.java
     │   ├── GoalOrientedSearchGraph.java
     │   └── ReplanPolicy.java
-    └── p2p/
-        ├── P2PPlanner.java
-        └── AgentActivator.java
+    ├── p2p/
+    │   ├── P2PPlanner.java
+    │   └── AgentActivator.java
+    └── llmcompiler/
+        ├── LlmCompilerPlanner.java
+        ├── LlmPlanCompiler.java
+        ├── LlmCompiledPlan.java
+        ├── PlanValidator.java
+        ├── DagLeveler.java
+        ├── LlmCompilerInstructions.java
+        ├── Joiner.java
+        ├── JoinDecision.java
+        ├── LlmJoiner.java
+        └── PredicateJoiner.java
 ```
 
 ### Class Index
@@ -919,10 +1111,20 @@ contrib/planners/src/main/java/com/google/adk/
 | `planner.goap` | `ReplanPolicy` | sealed interface | Failure handling policy (Ignore/FailStop/Replan) |
 | `planner.p2p` | `P2PPlanner` | final class | Reactive dynamic activation with refinement |
 | `planner.p2p` | `AgentActivator` | final class (pkg) | Per-agent activation state tracking |
+| `planner.llmcompiler` | `LlmCompilerPlanner` | final class | Plan-and-Execute: LLM-authored DAG + Joiner replanning |
+| `planner.llmcompiler` | `LlmPlanCompiler` | final class | Compile pipeline: LLM call + validate + self-repair + GOAP fallback |
+| `planner.llmcompiler` | `LlmCompiledPlan` | record | Parsed plan: label + tasks (`id`, `agent`, `dependsOn`) |
+| `planner.llmcompiler` | `PlanValidator` | final class | Validates a plan against the `AgentMetadata` catalog |
+| `planner.llmcompiler` | `DagLeveler` | final class | Levels `dependsOn` edges into parallel name groups |
+| `planner.llmcompiler` | `LlmCompilerInstructions` | final class | Builds the planning prompt (catalog + rules + feedback) |
+| `planner.llmcompiler` | `Joiner` | interface | Decides finish-vs-replan after a plan is exhausted |
+| `planner.llmcompiler` | `JoinDecision` | sealed interface | `Finish(result)` / `Replan(feedback)` |
+| `planner.llmcompiler` | `LlmJoiner` | final class | LLM-based joiner (parses `FINISH:`/`REPLAN:`) |
+| `planner.llmcompiler` | `PredicateJoiner` | final class | Deterministic joiner over session state |
 
 ---
 
-## 10. License
+## 11. License
 
 ```
 Copyright 2025 Google LLC

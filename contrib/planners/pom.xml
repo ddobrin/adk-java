@@ -39,6 +39,13 @@
             <groupId>com.google.genai</groupId>
             <artifactId>google-genai</artifactId>
         </dependency>
+        <!-- LLMCompiler planner parses the planning LLM's JSON DAG (version from the parent's
+             imported jackson-bom). Present transitively via google-adk, declared here because the
+             module uses Jackson directly. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
 
         <!-- Test dependencies -->
         <dependency>
